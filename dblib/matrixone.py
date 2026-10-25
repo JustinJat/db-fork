@@ -193,6 +193,46 @@ def _qt(db: str, table: str) -> str:
     return f"{_quote(db)}.{_quote(table)}"
 
 
+def _ddl_defaults(ddl: str) -> dict:
+    """Read SQL default expressions from MO's canonical SHOW CREATE output.
+
+    COLUMN_DEFAULT is a value on newer MO releases and SQL text on older
+    ones; quoting it heuristically loses expressions or literal quotes.
+    Tokenize quoted strings/identifiers intact and split at table depth.
+    """
+    tokens = list(re.finditer(r"'(?:[^'\\]|\\.|'')*'|\"(?:[^\"\\]|\\.|\"\")*\"|"
+                             r"`(?:[^`]|``)*`|[\w$]+|[^\s]", ddl))
+    out, clause, depth = {}, [], 0
+
+    def read_column(parts):
+        if not parts or not parts[0].group().startswith("`"):
+            return
+        name = parts[0].group()[1:-1].replace("``", "`")
+        level, start = 0, None
+        for token in parts[1:]:
+            word = token.group().upper()
+            if start is not None and level == 0 and word in {
+                "COMMENT", "ON", "AUTO_INCREMENT", "NOT", "PRIMARY", "UNIQUE", "REFERENCES", "CHECK"
+            }:
+                out[name] = ddl[start:token.start()].strip()
+                return
+            if word == "DEFAULT" and level == 0:
+                start = token.end()
+            level += (word == "(") - (word == ")")
+        if start is not None:
+            out[name] = ddl[start:parts[-1].end()].strip()
+
+    for token in tokens:
+        word = token.group()
+        if (word == "," and depth == 1) or (word == ")" and depth == 1):
+            read_column(clause)
+            clause = []
+        elif depth >= 1:
+            clause.append(token)
+        depth += (word == "(") - (word == ")")
+    return out
+
+
 def branch_db_name(db_name: str, branch_name: str) -> str:
     """The database of a branch's first generation."""
     return gen_db_name(db_name, branch_name, 0)
@@ -678,7 +718,7 @@ class MatrixOneToolSuite(DBToolSuite):
         return [name for _, name in pk]
 
     # "table does not exist" (also for a table absent at the snapshot).
-    _ER_NO_TABLE = 1064
+    _ER_NO_TABLE = (1064, 1146)  # older MO parse error; newer MySQL-compatible code
 
     def _readable(self, state: _State, table: str) -> bool:
         """Does the table exist at ``state``? Any other error (unknown
@@ -688,7 +728,7 @@ class MatrixOneToolSuite(DBToolSuite):
             self._execute(f"SELECT 1 FROM {state.expr(table)} LIMIT 0")
             return True
         except pymysql.MySQLError as e:
-            if e.args and e.args[0] == self._ER_NO_TABLE and "does not exist" in str(e.args[1]):
+            if e.args and e.args[0] in self._ER_NO_TABLE and "does not exist" in str(e.args[1]):
                 return False
             raise
 
@@ -961,14 +1001,23 @@ class MatrixOneToolSuite(DBToolSuite):
                 elif str(ctype).lower() != str(have[name]).lower():
                     raise RuntimeError(f"schema conflict on {table}.{name}: types differ "
                                        f"(ours {have[name]}, theirs {ctype})")
+        # Fetch canonical SQL only for tables whose new columns have
+        # defaults; ordinary merges keep their constant metadata cost.
+        defaults = {}
+        for table in sorted({t for t, _, _, d in plan_cols if d is not None}):
+            ddl = self._execute(f"SHOW CREATE TABLE {_qt(theirs.db, table)}")[0][1]
+            defaults[table] = _ddl_defaults(ddl)
+        for table, name, _, default in plan_cols:
+            if default is not None and name not in defaults[table]:
+                raise RuntimeError(f"Cannot read default expression for {table}.{name}")
         for table in new_tables:
             self._execute(f"DATA BRANCH CREATE TABLE {_qt(ours_db, table)} FROM {theirs.expr(table)};")
             # A snapshot clone can have an older schema than the source's
             # current catalog. New tables are excluded from the merge loop.
         for table, name, ctype, default in plan_cols:
             ddl = f"ALTER TABLE {_qt(ours_db, table)} ADD COLUMN {_quote(name)} {ctype} NULL"
-            if default is not None and str(default).lower() != "null":
-                ddl += f" DEFAULT {default}"
+            if default is not None:
+                ddl += f" DEFAULT {defaults[table][name]}"
             self._execute(ddl)
             ours_catalog[table]["columns"].append((name, ctype, "YES", default))
         return {"added_tables": new_tables,

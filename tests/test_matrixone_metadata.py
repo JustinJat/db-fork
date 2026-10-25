@@ -68,6 +68,8 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
             if args[0] == "theirs" and version[0]:
                 cols.append(("extra", "int", "YES", "7", None))
             return [(f"t{i}", *col) for i in range(table_count) for col in cols]
+        if sql.startswith("SHOW CREATE TABLE"):
+            return [("t", "CREATE TABLE `t` (`id` int, `v` int, `extra` int DEFAULT 7)")]
         if sql.startswith(("SHOW", "SELECT")):
             raise AssertionError(f"unexpected per-table metadata query: {sql}")
         return None
@@ -109,3 +111,19 @@ def test_commit_index_migration_does_not_hide_failure():
     s._execute_ddl = Mock(side_effect=pymysql.MySQLError(1105, "catalog unavailable"))
     with pytest.raises(pymysql.MySQLError, match="catalog unavailable"):
         s._ensure_commit_index("db")
+
+
+def test_ddl_defaults_preserve_literals_expressions_and_quoted_identifiers():
+    ddl = r"""CREATE TABLE `t` (
+      `id` int NOT NULL,
+      `a` varchar(50) DEFAULT 'NULL' COMMENT 'DEFAULT ignored',
+      `b``x` varchar(50) DEFAULT 'it''s, (fine) \\ DEFAULT',
+      `c` timestamp DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+      `d` int DEFAULT (-7 + (3 * 2)),
+      `e` varchar(20) DEFAULT '',
+      PRIMARY KEY (`id`)
+    )"""
+    assert mo._ddl_defaults(ddl) == {
+        "a": "'NULL'", "b`x": r"'it''s, (fine) \\ DEFAULT'",
+        "c": "CURRENT_TIMESTAMP(6)", "d": "(-7 + (3 * 2))", "e": "''",
+    }

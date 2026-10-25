@@ -285,9 +285,10 @@ def test_rebase_carries_column_default(suite):
 
     r = suite.rebase("feat", "main")
     assert r.ok, r.error
-    assert rows(suite, "feat", "SELECT column_default FROM information_schema.columns "
-                               "WHERE table_schema = DATABASE() AND table_name = 't' "
-                               "AND column_name = 'cat'") == [("'general'",)]
+    # COLUMN_DEFAULT changed from SQL text to MySQL-compatible values in
+    # newer MO; the canonical SQL and inserted values must stay identical.
+    ddl = rows(suite, "feat", "SHOW CREATE TABLE t")[0][1]
+    assert matrixone._ddl_defaults(ddl)["cat"] == "'general'"
     suite.exec(["INSERT INTO t (id, v, n) VALUES (60,'sixty',60)"], refs=["feat"])
     got = dict(rows(suite, "feat", "SELECT id, cat FROM t WHERE id IN (40, 50, 60)"))
     assert got[40] == "general" and got[60] == "general"
