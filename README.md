@@ -1068,6 +1068,50 @@ The engine's existing schema compatibility rules still apply; the adapter
 continues to reconcile schema before native merge. Live checks also confirmed
 zero staging time for insert-only merges across all three MERGE interfaces.
 
+MO commit `b9342f82a` clears each MERGE UPDATE/DELETE stage immediately before
+its next load, instead of after every applied batch. The final batch is
+reclaimed by DROP. A stage consumed by N batches now needs N−1 clearing
+statements instead of N; a single-batch stage needs none. Staging DDL and
+client SQL counts are unchanged. Clearing still uses the same transaction and
+retryable statement executor, and remains charged to `apply`; final DROP
+remains in `stage_cleanup`. PICK and portable SQL output retain their existing
+clearing behavior.
+
+A fresh comparison on 2026-10-25 used baseline `5a2943202`, optimized build
+`b9342f82a`, and clean adapter `60be6f1`. It used the same workload, INFO logs,
+three repetitions, alternating interfaces, and baseline-first procedure above.
+Medians in ms:
+
+| Interface / tables | Client merge before → after | Server merge before → after | Apply before → after | Stage init + cleanup before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Table summary / 1 | 203 → 205 | 69 → 59 | 29 → 7 | 19 → 22 |
+| Database / 1 | 186 → 214 | 69 → 60 | 31 → 7 | 16 → 23 |
+| Table summary / 10 | 940 → 665 | 771 → 508 | 284 → 60 | 214 → 194 |
+| Database / 10 | 762 → 656 | 644 → 496 | 293 → 67 | 179 → 214 |
+
+Ten-table client latency improved about 29%/14% for table/database merges;
+their apply phases fell about 79%/77%. One-table client latency increased
+about 1%/15%, despite lower server times. The database case also spent more
+time initializing/dropping stages. These small local samples show the removed
+apply work, not a universal latency improvement. All 24 before/after runs
+checked conflicts and data after merge/revert/reset, with complete server
+timings; client merge counts remain 15 for one table and 24/15 for ten tables.
+Use the same profiler command above with these server revisions to reproduce.
+
+Regression coverage includes repeated stage loads, clear failures, cancellation,
+and a database merge with 90,000 updates plus 85,000 deletes, exceeding the
+81,920-row flush limit. The large case checks both explicit transaction rollback
+and committed results. Eighteen live cases across plain/table-summary/database
+MERGE check data, summaries, timings, and absence of leaked stages.
+
+A separate probe exposed an existing large repeated-merge failure, reproduced
+on baseline `5a2943202` as well as this change: seed 90,000 `(id,v)=(i,i)` rows,
+fork the database, increment every source `v`, and merge with ACCEPT; increment
+every source `v` again, then repeat database MERGE with OUTPUT SUMMARY inside
+BEGIN. The second merge can fail with duplicate primary key error 1062. This
+case remains unresolved; the successful large rollback test above starts from
+an unmerged fork and does not establish that consecutive large merges work.
+
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
