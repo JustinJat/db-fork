@@ -19,6 +19,7 @@ def suite(monkeypatch, tmp_path):
     DBToolSuite.__init__(s, Mock(), ResultCollector(output_dir=str(tmp_path)))
     s._warned = set()
     s._database_branch_supported = {"diff": None, "merge": None}
+    s._database_restore_supported = {"reset": None, "revert": None}
     s._merge_summary_supported = None
     s._on = Mock(return_value="ours")
     s._state = Mock(return_value=mo._State("theirs"))
@@ -145,18 +146,18 @@ def test_empty_merge_does_not_claim_a_native_request(suite):
     assert not any("DATA BRANCH MERGE" in call.args[0] for call in suite._execute.call_args_list)
 
 
-@pytest.mark.parametrize("native,path", [(True, "restore_database"), (False, "legacy_reset")])
-def test_reset_reports_actual_path(suite, monkeypatch, native, path):
-    monkeypatch.setattr(mo, "MO_NATIVE_RESET", native)
+@pytest.mark.parametrize("supported,path", [(True, "database_reset"), (False, "legacy_reset")])
+def test_reset_reports_native_or_disabled_path(suite, supported, path):
     schema = {"a": {"cols": {"id": "int"}, "pk": ["id"]}}
     suite._find_commit.return_value = {"db": "ours", "snap": "s", "seq": 1, "schema_json": json.dumps(schema)}
-    suite._use = Mock()
+    suite._fingerprint = Mock(return_value=schema)
+    suite._database_restore_supported["reset"] = supported
     suite._execute = Mock()
     suite._undo_since = Mock()
     result = suite.reset("main", "commit")
     assert result.ok, result.error
     assert result.execution_paths == [path]
-    assert result.fallback_reasons == []
+    assert result.fallback_reasons == ([] if supported else ["database_reset: disabled"])
 
 
 def test_profiler_captures_server_identity_and_closes_connection(monkeypatch):

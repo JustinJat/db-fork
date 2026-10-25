@@ -753,7 +753,7 @@ which covers the whole server.
 
 The native-summary and database-level commands measured below are extensions
 on [zuyu/matrixone, branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt),
-including commits `8fae23f97`, `c870e3748`, and `314f7fb5a`.
+including commits `8fae23f97`, `c870e3748`, `314f7fb5a`, and `9b5b22463`.
 Build that branch (or the stated commit) to reproduce those measurements;
 a stock MatrixOne build can select the legacy interface. Check the profiler's
 server identity and observed paths before comparing results.
@@ -831,16 +831,28 @@ same summary for the report):
   upstream, "theirs" = the branch, as in git), and the clone replaces the
   branch. Its lineage now starts at the upstream head, so MatrixOne's LCA
   for a later merge is that head and the merge sees only newer changes.
-- `reset()` (composed): `DATA BRANCH DIFF` of the head against the commit's
-  snapshot, undone with SQL (rows added since are deleted, rows changed or
-  deleted put back, tables and columns created since dropped). The native
-  `RESTORE DATABASE <branch> {snapshot}` (`MO_NATIVE_RESET=1`) does it in
-  one statement but gives the tables new identities, and later lineage
-  diffs across that edge report updated rows as inserted on both sides,
-  which broke the rebase of reset batches in S6. A commit inherited from
-  the parent is restored row by row from the snapshot's time-travel view.
-- `revert()` (simulated): `DATA BRANCH DIFF` between the commit's snapshot
-  and its predecessor, inverse applied with SQL.
+- `reset()` (native data operation with adapter bookkeeping):
+  `DATA BRANCH RESET DATABASE <branch> FROM <db>{snapshot = 'commit'}`
+  restores data in place, retaining table identities and branch lineage.
+  It also accepts a commit inherited from the parent. Primary-key tables
+  apply the differences; keyless tables replace their contents, including
+  duplicate rows. Normal mode reconciles schema separately. Older servers
+  use the existing diff-driven SQL restore; schema differences also take
+  that path until native RESET support has been established. Native-only
+  mode (`DBFORK_NATIVE_ONLY=1`) skips schema reconciliation and falls back
+  to `RESTORE DATABASE` on older servers for same-database snapshots; that
+  older command replaces table identities and affects later lineage diffs.
+- `revert()` (native data operation with adapter bookkeeping):
+  `DATA BRANCH REVERT DATABASE <branch> FROM <db>{snapshot = 'after'}
+  AGAINST <db>{snapshot = 'before'}` applies the inverse of the commit.
+  It preserves later changes to other keys; changes to the same key are
+  overwritten by the before-image. Normal mode uses this path when all
+  three schemas match and retains the existing row replay for older servers
+  or schema-changing commits. As before, the adapter skips keyless tables
+  during revert; the raw server command rejects them. Set
+  `MO_DATABASE_RESTORE=0` to compare the legacy reset/revert paths. Only an
+  initial parser rejection permits fallback; runtime errors are propagated
+  without replaying the operation.
 - `delete()` (native): `DATA BRANCH DELETE DATABASE` (`DROP DATABASE` after
   a restore, which leaves the database without branch metadata).
 
@@ -857,7 +869,7 @@ cleanup, and handshakes are excluded. `connect` means switching the adapter
 to an existing branch. `create` means branching from the current head.
 The workload changes 100 source rows and 50 target rows per table, inserts
 one source row, then merges with `ours`, reverts, and resets. Row counts and
-sums are checked after merge and reset. There are no schema migrations.
+sums are checked after merge, revert, and reset. There are no schema migrations.
 Historical refs, chunked row replay, and different connection state can
 change the counts.
 
@@ -950,20 +962,47 @@ kept the row count and sum unchanged; their median changed from 175 ms to
 need only one diff pass for a no-op. These small samples do not establish
 throughput or tail latency.
 
-MO commit `314f7fb5a` adds database-level DIFF/MERGE. With the same profiler
-workload (`--modes summary database`, one verification run per mode), client
-statement counts changed as follows:
+MO commit `314f7fb5a` adds database-level DIFF/MERGE, and `9b5b22463` adds
+server-side RESET/REVERT. A final comparison on 2026-10-25 used that server
+for both modes, with the restore-enabled adapter, INFO logging, and three
+repetitions per mode (`--modes summary database`). The order alternated
+between repetitions. `summary` uses table-level summaries and client row
+restore; `database` uses the new database commands. Client statement counts
+were identical across repetitions:
 
 | Operation | Table interface: 1 table | Database interface: 1 table | Table interface: 10 tables | Database interface: 10 tables |
 | --- | ---: | ---: | ---: | ---: |
 | diff | 13 | 9 | 40 | 9 |
 | merge | 15 | 15 | 24 | 15 |
+| revert | 17 | 11 | 89 | 11 |
+| reset | 14 | 7 | 77 | 7 |
+
+| Operation | Table/client path median (ms): 1 table | Database path median (ms): 1 table | Table/client path median (ms): 10 tables | Database path median (ms): 10 tables |
+| --- | ---: | ---: | ---: | ---: |
+| diff | 54 | 35 | 195 | 154 |
+| merge | 285 | 274 | 1446 | 1519 |
+| revert | 149 | 141 | 940 | 525 |
+| reset | 106 | 96 | 836 | 530 |
+
+For ten tables, revert returned 44 rows / 5,127 response bytes instead of
+593 / 29,866; reset returned 22 / 2,317 instead of 572 / 28,052. The remaining
+rows are adapter metadata: native RESET/REVERT return only status. This small
+local sample shows fewer round trips and faster restore, but no ten-table
+merge latency improvement. It is not a throughput or tail-latency result.
 
 These counts include adapter metadata and commit bookkeeping. The native
 data operation itself takes one request regardless of table count. Server
 merge work remains one HashDiff per table. MERGE checks permissions for all
 selected tables before applying data and rolls back the entire data statement
 if a later table fails. Schema changes are still reconciled by the adapter.
+RESET/REVERT likewise preflight the selected tables, stage all changes, and
+apply them in one transaction. Schema reconciliation and adapter commit-log
+updates remain outside that data transaction. The server currently computes
+restore differences using joins over snapshot endpoints, so reducing client
+SQL does not imply constant server work or an incremental storage-level
+restore. MO commit `31d7c8437` fixes snapshot read-view reuse so a query joining
+two historical versions of the same table reads the correct version on each
+side; the restore commands depend on this fix.
 
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against

@@ -134,6 +134,11 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
                 "diff": None if mode == "database" else False,
                 "merge": None if mode == "database" else False,
             }
+        if hasattr(suite, "_database_restore_supported"):
+            suite._database_restore_supported = {
+                "reset": None if mode == "database" else False,
+                "revert": None if mode == "database" else False,
+            }
         with suite.conn.cursor() as cur:
             for i in range(table_count):
                 cur.execute(f"CREATE TABLE t{i}(id INT PRIMARY KEY, v INT)")
@@ -178,7 +183,15 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
                 if tuple(map(int, actual)) != (rows + 1, expected_sum):
                     raise AssertionError((actual, expected_sum))
             measure("revert", lambda: suite.revert("main", merged["hash"]))
+            if mode == "database" and suite._database_restore_supported["revert"] is not True:
+                raise RuntimeError("Server-side database REVERT was not used")
+            for i in range(table_count):
+                actual = suite._execute(f"SELECT COUNT(*), SUM(v) FROM t{i}")[0]
+                if tuple(map(int, actual)) != (rows, rows * (rows - 1) // 2 + 2 * (changed // 2)):
+                    raise AssertionError(("revert", actual))
             measure("reset", lambda: suite.reset("main", base))
+            if mode == "database" and suite._database_restore_supported["reset"] is not True:
+                raise RuntimeError("Server-side database RESET was not used")
             measure("delete", lambda: suite.delete("feature"))
             for i in range(table_count):
                 actual = suite._execute(f"SELECT COUNT(*), SUM(v) FROM t{i}")[0]

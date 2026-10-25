@@ -64,7 +64,8 @@ def test_bulk_catalog_matches_table_metadata_and_indexes_existing_logs(suite):
 @needs_simulated
 def test_implementation_summary():
     impl = matrixone.MatrixOneToolSuite.implementation()
-    assert impl["branch"] == "native" and impl["merge"] == "native" and impl["revert"] == "simulated"
+    assert impl["branch"] == "native" and impl["merge"] == "native"
+    assert impl["revert"] == ("native" if matrixone.MO_DATABASE_RESTORE else "simulated")
     assert set(impl) >= {"branch", "commit", "diff", "log", "merge", "rebase", "revert",
                          "reset", "delete", "commit_refs", "multi_ref_exec"}
 

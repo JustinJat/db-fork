@@ -50,13 +50,13 @@ report uses):
                per on_conflict; the registry is repointed and the old
                generation dropped (the lineage now starts at the upstream
                head, so a later merge back sees only newer changes)
-    revert     DATA BRANCH DIFF between the commit's snapshot and its
-               predecessor; the inverse is applied with SQL
-    reset      DATA BRANCH DIFF between the head and the commit's snapshot,
-               the differences undone with SQL (RESTORE DATABASE does it in
-               one statement, used in native-only mode, but later diffs
-               across the restore misreport updated rows); a commit inherited from the
-               parent is restored row by row from its time-travel view
+    revert     DATA BRANCH REVERT DATABASE between the commit's snapshot
+               and its predecessor; legacy row replay for older servers
+               and schema-changing commits
+    reset      DATA BRANCH RESET DATABASE from the commit's snapshot,
+               restoring rows in place and preserving table identities;
+               normal mode reconciles schema and can use legacy row replay;
+               native-only mode falls back to RESTORE DATABASE on older servers
     delete     DATA BRANCH DELETE DATABASE (DROP DATABASE as fallback)
 
 A multi-ref script addresses another branch through its current
@@ -119,12 +119,13 @@ MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("
 # Unsupported servers are detected once per connection by a parser error.
 MO_MERGE_SUMMARY = os.environ.get("MO_MERGE_SUMMARY", "1").lower() not in ("0", "false", "no")
 MO_DATABASE_BRANCH = os.environ.get("MO_DATABASE_BRANCH", "1").lower() not in ("0", "false", "no")
+MO_DATABASE_RESTORE = os.environ.get("MO_DATABASE_RESTORE", "1").lower() not in ("0", "false", "no")
 
-# Native-only mode (DBFORK_NATIVE_ONLY=1) resets with the engine's own
-# RESTORE DATABASE as it is (it gives the restored tables new identities
-# and later lineage diffs across that edge misreport updated rows).
-# Otherwise reset undoes a native diff of the branch's own two snapshots
-# with SQL. Rebase has no native counterpart that meets the contract
+# Native-only mode (DBFORK_NATIVE_ONLY=1) uses the server's data-only RESET
+# without client schema reconciliation. Older servers fall back to their
+# RESTORE DATABASE (which replaces identities and affects later lineage
+# diffs). Normal mode can also use the legacy diff-driven row restore.
+# Rebase has no native counterpart that meets the contract
 # (DATA BRANCH PICK, see the limitations), so it is simulated in every
 # mode and unsupported in native-only mode.
 MO_NATIVE_RESET = native_only()
@@ -357,8 +358,8 @@ class MatrixOneToolSuite(DBToolSuite):
         "log": "simulated",
         "merge": "native",
         "rebase": "simulated",   # PICK loses rows and refuses schema differences
-        "revert": "simulated",
-        "reset": "native" if MO_NATIVE_RESET else "simulated",
+        "revert": "native" if MO_DATABASE_RESTORE else "simulated",
+        "reset": "native" if MO_NATIVE_RESET or MO_DATABASE_RESTORE else "simulated",
         "delete": "native",
         "commit_refs": "native",
         "multi_ref_exec": "native",
@@ -383,11 +384,11 @@ class MatrixOneToolSuite(DBToolSuite):
                    "its head snapshot's time-travel view (DATA BRANCH PICK loses rows and refuses "
                    "schema differences); conflicts from two native diffs; the registry is "
                    "repointed and the old generation dropped"),
-        "revert": "DATA BRANCH DIFF commit vs predecessor; inverse applied with SQL",
-        "reset": ("RESTORE DATABASE {snapshot}" if MO_NATIVE_RESET else
-                  "DATA BRANCH DIFF head vs the commit's snapshot, rows put back with SQL "
-                  "(RESTORE DATABASE breaks later lineage diffs)")
-                 + "; SQL row restore for commits inherited from a parent",
+        "revert": "DATA BRANCH REVERT DATABASE using after/before snapshots; "
+                  "legacy row replay for older servers or schema-changing commits",
+        "reset": "DATA BRANCH RESET DATABASE restores rows in place and preserves lineage; "
+                 "normal mode reconciles schema and retains a legacy row restore; "
+                 "native-only mode falls back to RESTORE DATABASE on older servers",
         "delete": "DATA BRANCH DELETE DATABASE (DROP DATABASE fallback)",
         "commit_refs": "time-travel reads t{snapshot = ...}",
         "multi_ref_exec": "cross-database queries",
@@ -423,6 +424,10 @@ class MatrixOneToolSuite(DBToolSuite):
         self._database_branch_supported = {
             "diff": None if MO_DATABASE_BRANCH else False,
             "merge": None if MO_DATABASE_BRANCH and MO_MERGE_SUMMARY else False,
+        }
+        self._database_restore_supported = {
+            "reset": None if MO_DATABASE_RESTORE else False,
+            "revert": None if MO_DATABASE_RESTORE else False,
         }
         self._meta_db = meta_db_name(db_name)
         self._ensure_registry()
@@ -1600,6 +1605,41 @@ class MatrixOneToolSuite(DBToolSuite):
     def _reset_impl(self, ref: Ref, to: str) -> None:
         db = self._on(ref)
         row = self._find_commit(db, to)
+        fp = json.loads(row["schema_json"]) if row.get("schema_json") else None
+        restored = False
+        if self._database_restore_supported["reset"] is not False:
+            if MO_NATIVE_RESET:
+                restored = self._database_restore("reset", db, _State(row["db"], row["snap"]))
+            elif fp is not None:
+                self._fk_checks(False)
+                try:
+                    retyped = []
+                    same_schema = self._fingerprint(db) == fp
+                    # Do not alter schema before an unknown server rejects
+                    # the syntax: the legacy path needs its original schema
+                    # differences to choose the correct restore strategy.
+                    if same_schema or self._database_restore_supported["reset"] is True:
+                        if not same_schema:
+                            retyped = self._reconcile_to_fingerprint(db, fp)[2]
+                        restored = self._database_restore(
+                            "reset", db, _State(row["db"], row["snap"]), tables=sorted(fp))
+                    else:
+                        self._record_execution(fallback_reason="database_reset: schema differs and support is unknown")
+                    if restored:
+                        for table, col, ctype in retyped:
+                            self._execute_ddl(f"ALTER TABLE {_qt(db, table)} MODIFY {_quote(col)} {ctype}")
+                finally:
+                    self._fk_checks(True)
+            else:
+                self._record_execution(fallback_reason="database_reset: missing schema metadata")
+        else:
+            self._native_path_unavailable("database_reset")
+        if restored:
+            sql = f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s"
+            if row["db"] != db:
+                sql += " AND kind NOT IN ('fork', 'rebase', 'root')"
+            self._execute(sql, (int(row["seq"]),))
+            return
         if row["db"] == db and MO_NATIVE_RESET:
             self._record_execution("restore_database")
             self._execute(f"RESTORE DATABASE {_quote(db)} {{snapshot = '{row['snap']}'}};")
@@ -1609,7 +1649,6 @@ class MatrixOneToolSuite(DBToolSuite):
             # already cut at the commit; make sure of it anyway.
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
-        fp = json.loads(row["schema_json"]) if row.get("schema_json") else None
         if row["db"] == db:
             self._record_execution("legacy_reset")
             self._undo_since(db, _State(db, row["snap"]), fp)
@@ -1818,7 +1857,73 @@ class MatrixOneToolSuite(DBToolSuite):
             raise ValueError(f"commit {commit} has no predecessor to revert to")
         after = _State(row["db"], row["snap"])
         before = _State(row["prev_db"], row["prev_snap"])
-        self._record_execution("legacy_revert")
+        restored = False
+        if self._database_restore_supported["revert"] is not False:
+            if native_only():
+                restored = self._database_restore("revert", db, after, before=before)
+            elif row.get("schema_json"):
+                after_schema = json.loads(row["schema_json"])
+                rows = self._execute(f"SELECT schema_json FROM {before.expr(COMMITS_TABLE)} "
+                                     "ORDER BY seq DESC LIMIT 1") or []
+                before_schema = json.loads(rows[0][0]) if rows and rows[0][0] else None
+                if before_schema == after_schema == self._fingerprint(db):
+                    # The legacy adapter only reverts primary-key tables.
+                    tables = sorted(t for t, spec in after_schema.items() if spec.get("pk"))
+                    self._fk_checks(False)
+                    try:
+                        restored = self._database_restore("revert", db, after, before=before, tables=tables)
+                    finally:
+                        self._fk_checks(True)
+                else:
+                    self._record_execution(fallback_reason="database_revert: schema differs or predecessor metadata is missing")
+            else:
+                self._record_execution(fallback_reason="database_revert: missing schema metadata")
+        else:
+            self._native_path_unavailable("database_revert")
+        if not restored:
+            if native_only():
+                raise self._unsupported("revert", "server does not support DATA BRANCH REVERT DATABASE")
+            self._record_execution("legacy_revert")
+            self._revert_rows(db, after, before)
+        head = self._head(db)
+        self._add_commit(db, "commit", f"revert {commit}", None, db, head["snap"], head["db"],
+                         take_snapshot=True)
+
+    def _database_restore(self, operation: str, db: str, source: _State,
+                          before: _State = None, tables=None) -> bool:
+        """Invoke an in-place server restore; only parser rejection permits replay."""
+        supported = self._database_restore_supported
+        path = f"database_{operation}"
+        if supported[operation] is False:
+            self._native_path_unavailable(path)
+            return False
+        if tables is not None and not tables:
+            self._record_execution("no_data_tables")
+            return True
+        sql = f"DATA BRANCH {operation.upper()} DATABASE {_quote(db)} FROM {self._database_expr(source)}"
+        if before is not None:
+            sql += " AGAINST " + self._database_expr(before)
+        if tables is None:
+            sql += f" IGNORE TABLES ({_quote(COMMITS_TABLE)})"
+        else:
+            sql += " TABLES (" + ", ".join(map(_quote, tables)) + ")"
+        try:
+            self._execute(sql)
+        except Exception as exc:
+            if (isinstance(exc, pymysql.MySQLError) and supported[operation] is None
+                    and exc.args and exc.args[0] == 1064
+                    and re.search(r'syntax error at .*near [\'\"]\s*(?:reset|revert|database)\b', str(exc), re.I)):
+                supported[operation] = False
+                self._native_path_unavailable(path, parser_rejected=True)
+                return False
+            self._record_execution(path)
+            raise
+        self._record_execution(path)
+        supported[operation] = True
+        return True
+
+    def _revert_rows(self, db: str, after: _State, before: _State) -> None:
+        """Compatibility path for older servers and schema-changing commits."""
         try:
             self._execute("SET SESSION foreign_key_checks = 0")
         except Exception:
@@ -1854,9 +1959,6 @@ class MatrixOneToolSuite(DBToolSuite):
                 self._execute("SET SESSION foreign_key_checks = 1")
             except Exception:
                 pass
-        head = self._head(db)
-        self._add_commit(db, "commit", f"revert {commit}", None, db, head["snap"], head["db"],
-                         take_snapshot=True)
 
     # -- delete ------------------------------------------------------------
 
