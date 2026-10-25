@@ -100,6 +100,61 @@ def test_combined_catalogs_preserve_identity_filtering_and_refresh(suite):
         suite._execute(f"DROP DATABASE `{empty}`")
 
 
+@pytest.mark.parametrize("max_seq", [None, 0, 11, 16])
+def test_copy_log_deduplicates_both_keys_and_preserves_cutoff_and_rollback(suite, max_seq):
+    from datetime import datetime
+
+    source, target = DB + "_log_source", DB + "_log_target"
+    columns = ", ".join(suite._LOG_COLS)
+
+    def entry(seq, commit_id, kind="commit"):
+        return (seq, commit_id, kind, "quoted ' message", "snapshot", source,
+                None, None, datetime(2026, 1, 1), '{"t":{"cols":{"id":"int"},"pk":["id"]}}')
+
+    target_rows = [entry(1, "shared"), entry(2, "target-seq"), entry(3, "same-id")]
+    source_rows = [entry(1, "shared"), entry(2, "source-seq"), entry(10, "same-id"),
+                   entry(11, "new'commit"), entry(12, "new-merge", "merge"),
+                   entry(13, "fork", "fork"), entry(14, "rebase", "rebase"),
+                   entry(15, "root", "root"), entry(16, "repeat"), entry(17, "repeat", "merge")]
+    try:
+        for db, entries in ((source, source_rows), (target, target_rows)):
+            suite._execute(f"CREATE DATABASE `{db}`")
+            suite._execute(matrixone._COMMITS_DDL.format(table=f"`{db}`.`_bb_commits`"))
+            for values in entries:
+                suite._execute(f"INSERT INTO `{db}`.`_bb_commits` ({columns}) "
+                               "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+
+        def read():
+            return list(suite._execute(f"SELECT {columns} FROM `{target}`.`_bb_commits` ORDER BY seq"))
+
+        added = [r for r in source_rows if r[2] in ("commit", "merge")
+                 and (max_seq is None or r[0] <= max_seq)
+                 and all(r[0] != t[0] and r[1] != t[1] for t in target_rows)]
+        expected = target_rows + added
+        suite._execute("BEGIN")
+        try:
+            suite._copy_log(target, source, max_seq=max_seq)
+            assert read() == expected
+        finally:
+            suite._execute("ROLLBACK")
+        assert read() == target_rows
+        suite._copy_log(target, source, max_seq=max_seq)
+        assert read() == expected
+        suite._copy_log(target, source, max_seq=max_seq)
+        assert read() == expected
+        # A later call must see newly appended history, without a stale key set.
+        extra = entry(30, "later")
+        suite._execute(f"INSERT INTO `{source}`.`_bb_commits` ({columns}) "
+                       "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", extra)
+        suite._copy_log(target, source)
+        all_added = [r for r in source_rows if r[2] in ("commit", "merge")
+                     and all(r[0] != t[0] and r[1] != t[1] for t in expected)]
+        assert read() == expected + all_added + [extra]
+    finally:
+        for db in (source, target):
+            suite._execute(f"DROP DATABASE IF EXISTS `{db}`")
+
+
 @needs_simulated
 def test_implementation_summary():
     impl = matrixone.MatrixOneToolSuite.implementation()

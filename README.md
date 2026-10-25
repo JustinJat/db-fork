@@ -895,12 +895,14 @@ revision metadata may return `unknown`, which is preserved as such.
 Static `implementation.notes` describe available strategies, not the path a
 particular server executed.
 
-The `_bb_commit_id` index was added to speed commit-id lookups, but its net
-effect has **not** been isolated in these measurements. The extra hidden
+The `_bb_commit_id` index was added to speed commit-id lookups. The earlier
+whole-workflow measurements do **not** isolate its net effect: the extra hidden
 index table cloned with each branch and index maintenance on commit inserts
-are costs included in the totals. These results do not establish an index
-benefit; that needs a separate indexed/unindexed comparison across log sizes,
-including lookup, branch creation, commit latency, and storage.
+are included in the totals. The later
+[commit-log profiler](scripts/profile_matrixone_commit_log.py) compares copying,
+lookups, and log-row inserts with/without the index, as described below. It
+still does not measure clone/storage costs or complete commit latency, so an
+overall index benefit remains unproven.
 
 Measured on 2026-10-25 against local MO commit `8fae23f97`, comparing original
 adapter `1ca34a3` with optimized adapter `c037fed` using native summaries:
@@ -1484,6 +1486,54 @@ databases, composite key order, defaults, quoted names, filtering views and
 bookkeeping tables, schema refresh, and error propagation before any schema
 write. All 104 MatrixOne adapter tests pass, including live merge/rebase,
 snapshot refs, custom resolvers, conflicts, reset, and revert.
+
+Commit-log copying now uses two equality `NOT EXISTS` predicates, one for
+`seq` and one for `id`, instead of one predicate containing `OR`. The statement
+still copies only source `commit`/`merge` rows absent from the destination by
+both keys, with the same optional historical sequence cutoff. It remains one
+`INSERT ... SELECT`, with no client-side key cache. MERGE and rebase both use
+this helper. Non-unique commit IDs remain supported, including two new source
+rows sharing an ID; a repeated copy observes the newly populated destination.
+
+On server `d33aa9d38`, EXPLAIN shows the old disjunctive anti-join replaced by
+two equality anti-joins. This avoids the long-history scaling problem without
+requiring the commit-id index. Measured on 2026-10-25 with adapter `1059271` plus
+this change: synthetic logs with N source commits and 90% already present on
+the destination, five repetitions alternating query and index order. Each
+copy was validated and rolled back before the next trial. Median statement
+latencies in ms, excluding BEGIN/ROLLBACK, setup, and checks:
+
+| Source log rows | With `_bb_commit_id`: old OR → new | Without index: old OR → new |
+| --- | ---: | ---: |
+| 10 | 1.45 → 2.67 | 2.10 → 2.64 |
+| 1,000 | 32.85 → 2.86 | 29.07 → 2.87 |
+| 10,000 | 2723.27 → 17.43 | 2735.97 → 10.98 |
+
+The indexed 10,000-row copy is about 156 times faster in this local test;
+the 10-row copy costs about 1 ms more. These are log-copy statement timings,
+not whole-MERGE timings or a general throughput guarantee. Client statement
+counts and native/legacy path reporting are unchanged.
+
+The same experiment separately measures `_find_commit` hits/misses and an
+`_add_commit` log-row insert with the schema already supplied and snapshot
+creation excluded. At 10,000 source / 9,000 destination rows, indexed versus
+unindexed medians were 1.67 / 1.32 ms for a lookup hit, 1.21 / 1.07 ms for a
+miss, and 1.70 / 1.07 ms for an insert. At 1,000 rows the index reduced lookup
+times; these small samples show no consistent benefit. The index is
+retained pending larger workloads and clone/storage measurements.
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_commit_log \
+  --rows 10 1000 10000 --reps 5 --out /tmp/mo-commit-log.json
+```
+
+The JSON records server identity, adapter revision/dirty state/source hash,
+raw timings, and both EXPLAIN plans. It retains the former SQL explicitly for
+a same-server comparison. Live regression coverage checks independent `seq`
+and `id` collisions, non-unique source IDs, excluded log kinds, inclusive
+cutoffs (including zero), every copied field, repeat copies, fresh history,
+and rollback. All 108 MatrixOne adapter tests pass, including the live tests.
+This step changes only the adapter.
 
 In a separate traced run of the 10-table UPDATE workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary

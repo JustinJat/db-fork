@@ -669,12 +669,16 @@ class MatrixOneToolSuite(DBToolSuite):
         return _State(row["db"], row["snap"], int(row["seq"]))
 
     def _copy_log(self, into_db: str, from_db: str, max_seq: int = None) -> None:
+        # Separate equality anti-joins let MO hash the two keys. A single
+        # OR predicate can compare every source row with the destination log.
         sql = (f"INSERT INTO {_qt(into_db, COMMITS_TABLE)} "
                f"({', '.join(self._LOG_COLS)}) "
                f"SELECT {', '.join('s.' + c for c in self._LOG_COLS)} "
                f"FROM {_qt(from_db, COMMITS_TABLE)} s WHERE s.kind IN ('commit', 'merge') "
                f"AND NOT EXISTS (SELECT 1 FROM {_qt(into_db, COMMITS_TABLE)} d "
-               "WHERE d.seq = s.seq OR d.id = s.id)")
+               "WHERE d.seq = s.seq) "
+               f"AND NOT EXISTS (SELECT 1 FROM {_qt(into_db, COMMITS_TABLE)} d "
+               "WHERE d.id = s.id)")
         if max_seq is not None:
             sql += f" AND s.seq <= {int(max_seq)}"
         self._execute(sql)
