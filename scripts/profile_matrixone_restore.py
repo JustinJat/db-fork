@@ -94,6 +94,17 @@ def run_once(tables, rows, changed, operation, mutation, server_log):
                 or record["empty_stages"] != expected_empty or record["table_count"] != tables
                 or record["status"] != "ok" or measurement["statements"] != 1):
             raise AssertionError(f"unexpected restore stage accounting: {record}")
+        catalogs = measurement["server_restore_metadata"]
+        if catalogs:
+            if len(catalogs) != 1:
+                raise AssertionError("expected one catalog record per native restore")
+            catalog = catalogs[0]
+            endpoints = 3 if operation == "revert" else 2
+            if (catalog.get("schema_version") != 1 or catalog.get("operation") != operation
+                    or catalog.get("database_opens") != endpoints
+                    or catalog.get("snapshot_resolutions") != endpoints - 1
+                    or catalog.get("relation_opens") != endpoints * tables):
+                raise AssertionError(f"unexpected restore metadata accounting: {catalog}")
         return {"tables": tables, "rows_per_table": rows, "changed_per_table": changed,
                 "mutation": mutation, "operation": operation, "validated": True, "measurement": measurement}
     finally:

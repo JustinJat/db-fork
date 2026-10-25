@@ -1829,6 +1829,70 @@ and cleanup batch boundaries. Final complete adapter workflows at 1 and 10
 tables passed merge/conflict/restore checks and captured complete restore work
 records. Client counts remain 11 for REVERT and 7 for RESET in that workload.
 
+MO commit `4efa5a736` reuses the endpoint snapshots and table definitions
+already read during RESET/REVERT catalog enumeration. The retained metadata
+exists only during the current statement's planning; each later request loads
+it again. Database and table snapshot scope checks and per-table authorization
+remain in place. DIFF/MERGE enumeration retains only table names as before.
+
+For ten selected ordinary tables, with no additional tables/views in the
+catalog, enumeration plus restore plan construction now makes these calls:
+
+| Metadata API calls | RESET before → after | REVERT before → after |
+| --- | ---: | ---: |
+| Database opens | 22 → 2 | 43 → 3 |
+| Historical endpoint resolutions | 11 → 1 | 22 → 2 |
+| Relation opens | 40 → 20 | 70 → 30 |
+
+These are calls on the catalog/planning path, not SQL statement counts. They
+exclude authorization and metadata reads inside generated SQL execution. The
+former `getRelations` pairs contributed two database/relation opens and one
+historical resolution per pair; RESET called it once per table, REVERT twice.
+The new planner uses the enumerated definitions directly, including the
+destination definition that REVERT previously opened twice.
+
+The profilers retain `DataBranch-Restore-Metadata` records under
+`server_restore_metadata`: database opens, historical resolutions, relation
+opens, and catalog enumeration time. Older servers produce an empty list.
+This timing excludes authorization, plan construction, stage/apply/cleanup,
+and transaction finish; it must not be added to client elapsed time. The raw
+restore profiler checks the new counts when present. The successful catalog
+event is emitted before authorization and does not imply request success.
+
+A separate 2026-10-25 comparison used the committed binaries `2de2c4d43`
+and `4efa5a736`, the same isolated port/data directory and INFO logging, and
+the restore profiler's 1/10-table, 1,000-row, 100-changed-row cases with three
+repetitions. All 120 native calls passed row, relation-ID, cleanup and stage
+checks. The baseline logged 10/20 `GetRelations-Done` events per ten-table
+RESET/REVERT; the new build logged zero and its catalog counters matched the
+table above in every sample. Restore-owned SQL counts and client requests
+were unchanged from the preceding optimization.
+
+| Changes being undone, 10 tables | RESET before/after median (ms) | REVERT before/after median (ms) |
+| --- | ---: | ---: |
+| No changes | 324 / 290 | 281 / 280 |
+| Insert only | 267 / 314 | 341 / 306 |
+| Delete only | 333 / 345 | 337 / 321 |
+| Update only | 380 / 382 | 438 / 381 |
+| Mixed | 391 / 420 | 450 / 442 |
+
+This sample establishes fewer metadata calls, not a consistent end-to-end
+speedup. One-table results were also mixed and mostly slower in the second
+block. The versions ran in separate blocks, alternating operation/case order
+within repetitions. Stage creation and cleanup still dominate and their
+timings varied. The new catalog enumeration itself took a median 1.6 ms for
+ten-table RESET and 2.6 ms for REVERT across the 15 samples per operation;
+there is no corresponding isolated catalog timing in the baseline.
+
+Go branch/diff/snapshot regressions cover metadata refresh between statements,
+recreated snapshot names, late schema mismatches, wrong-database/table-only
+snapshots, denied writes before any table changes, hidden indexes/views, and
+metadata read failures. Python profiling tests check current-operation
+attribution and keep catalog time separate from restore work. All 154 Python
+adapter/profile/live tests passed on the built server. Complete 1/10-table
+adapter workflows also passed and captured one catalog record per native
+restore, with no repeated relation-pair resolution and unchanged client counts.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and

@@ -253,6 +253,10 @@ class SQLTrace:
                 expected = sum(r["error"] is None and r["sql"].lstrip().upper().startswith(prefix)
                                for r in self.records)
                 measurement["server_restore_work"] = summarize_restore_work(records, expected, operation)
+                # Catalog events cover enumeration before authorization/planning,
+                # separately from stage/apply/cleanup work and client requests.
+                measurement["server_restore_metadata"] = [
+                    r for r in records if r.get("msg") == "DataBranch-Restore-Metadata"]
             if operation in ("diff", "merge") and not events["DataBranch-HashDiff-Done"]:
                 raise RuntimeError("No HashDiff events captured; use an exclusive server with INFO JSON logging")
         return result, measurement

@@ -96,7 +96,11 @@ def test_old_restore_server_does_not_report_zero_work():
 @pytest.mark.parametrize("operation", ["reset", "revert"])
 def test_trace_attributes_restore_work_to_current_native_request(tmp_path, operation):
     log = tmp_path / "mo.log"
-    log.write_text(json.dumps(restore_event(operation)) + "\n")
+    endpoints = 3 if operation == "revert" else 2
+    metadata = {"msg": "DataBranch-Restore-Metadata", "schema_version": 1,
+                "operation": operation, "database_opens": endpoints, "snapshot_resolutions": endpoints - 1,
+                "relation_opens": endpoints, "catalog_ms": 5}
+    log.write_text(json.dumps(restore_event(operation)) + "\n" + json.dumps(metadata) + "\n")
     trace = SQLTrace(SimpleNamespace(), log)
 
     def restore():
@@ -104,11 +108,16 @@ def test_trace_attributes_restore_work_to_current_native_request(tmp_path, opera
                               "error": None, "received_bytes": 11, "returned_rows": 0})
         with log.open("a") as out:
             out.write(json.dumps(restore_event(operation)) + "\n")
+            out.write(json.dumps(metadata) + "\n")
 
     _, result = trace.measure(operation, restore)
     assert result["statements"] == 1
     assert result["server_restore_work"]["sql_statements"] == 3
     assert result["server_restore_work"]["complete"]
+    assert result["server_restore_metadata"] == [metadata]
+    assert result["server_restore_work"]["total_ms"] == 6  # catalog time is separate
+    _, result = trace.measure(operation, lambda: None)
+    assert result["server_restore_metadata"] == []
     _, result = SQLTrace(SimpleNamespace()).measure(operation, lambda: None)
     assert "server_restore_work" not in result
 
