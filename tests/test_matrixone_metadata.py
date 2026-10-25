@@ -103,8 +103,12 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
     assert sum(sql.startswith("DATA BRANCH MERGE") for sql, _ in queries) == 2 * table_count
     if native_summary:
         s._summary.assert_not_called()
+        s._readable.assert_not_called()
     else:
         assert s._summary.call_count == 2 * table_count
+        # Only historical bases need visibility probes, once per table
+        # per operation; the two current head catalogs are sufficient.
+        assert s._readable.call_count == 2 * table_count
 
 
 def test_commit_index_migration_handles_concurrent_initialization():
@@ -137,3 +141,16 @@ def test_ddl_defaults_preserve_literals_expressions_and_quoted_identifiers():
         "a": "'NULL'", "b`x": r"'it''s, (fine) \\ DEFAULT'",
         "c": "CURRENT_TIMESTAMP(6)", "d": "(-7 + (3 * 2))", "e": "''",
     }
+
+
+def test_snapshot_schema_checks_visibility_even_when_current_catalog_has_table():
+    s = suite()
+    s._readable = Mock(return_value=False)
+    s._execute = Mock()
+    past = mo._State("source", "old_snapshot")
+    current_catalog = {"new_table": {"pk": ["id"], "columns": [("id", "int", "NO", None)]}}
+    assert s._reconcile_schema("destination", past, {}, current_catalog) == {
+        "added_tables": [], "added_columns": [],
+    }
+    s._readable.assert_called_once_with(past, "new_table")
+    s._execute.assert_not_called()

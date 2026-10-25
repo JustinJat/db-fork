@@ -992,7 +992,10 @@ class MatrixOneToolSuite(DBToolSuite):
         ours_catalog = self._catalog(ours_db) if ours_catalog is None else ours_catalog
         theirs_catalog = self._catalog(theirs.db) if theirs_catalog is None else theirs_catalog
         ours = set(ours_catalog)
-        theirs_tables = [t for t in theirs_catalog if self._readable(theirs, t)]
+        # The current catalog already establishes visibility at the head.
+        # Historical refs still need a probe: a current table may not have
+        # existed at the requested snapshot.
+        theirs_tables = [t for t in theirs_catalog if not theirs.snap or self._readable(theirs, t)]
         new_tables = sorted(set(theirs_tables) - ours)
         plan_cols = []
         for table in sorted(ours & set(theirs_tables)):
@@ -1192,7 +1195,7 @@ class MatrixOneToolSuite(DBToolSuite):
         self._fk_checks(False)
         try:
             for table in sorted(ours_catalog.keys() & theirs_catalog.keys()):
-                if table in schema["added_tables"] or not self._readable(theirs, table):
+                if table in schema["added_tables"] or (theirs.snap and not self._readable(theirs, table)):
                     continue
                 # Native summaries keep conflict rows on the server. A
                 # custom resolver still needs the legacy row-level path.
