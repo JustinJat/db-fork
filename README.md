@@ -791,11 +791,13 @@ same summary for the report):
   selects the legacy path for comparison. Automatic fallback occurs once
   per connection, only after a parser rejection at `OUTPUT`; execution and
   transport errors are never retried as a legacy merge.
-  The initial server implementation shares endpoint/lineage resolution
-  but traverses differences twice: once for statistics, once for apply.
-  It retains changed primary keys during statistics, requiring memory
-  proportional to the changed keys. Fewer client statements do not imply
-  a single engine pass. Database-wide atomic merge is not provided by this
+  The optimized server collects statistics before update expansion and
+  conflict filtering in the same `HashDiff` execution used for apply.
+  It reuses retained destination batches to exclude equal changes and
+  releases matched primary keys as both sides arrive. Worst-case summary
+  memory remains proportional to changed keys. Apply stages are created
+  only when a nonempty batch needs applying, so a no-op does not create
+  temporary tables. Database-wide atomic merge is not provided by this
   per-table interface.
 - `rebase()` (composed): a re-fork. A temporary clone of the upstream's
   head snapshot receives the branch's delta since its fork point through
@@ -862,9 +864,38 @@ test server configured for INFO JSON logging. The report counts appended
 internal diff passes, not total engine SQL statements. Log rotation and
 other clients make this attribution invalid.
 In a separate traced run of the same 10-table workload, legacy merge emitted
-40 `HashDiff-Done` and 40 `GetRelations-Done` events; native summaries emitted
-20 and 10 respectively. Thus the initial implementation halves diff passes
-and shares relation resolution, while still doing two passes per table.
+40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
+implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
+resolution but still did two diff passes per table.
+
+MO commit `c870e3748` collects the summary within the merge's existing diff
+traversal. A fresh comparison on 2026-10-25 kept adapter `7891e91`, the workload,
+and INFO logging configuration fixed, with three repetitions per server:
+
+| Merge metric | Two passes: 1 table | One pass: 1 table | Two passes: 10 tables | One pass: 10 tables |
+| --- | ---: | ---: | ---: | ---: |
+| Median latency (ms) | 296 | 259 | 1661 | 1404 |
+| Client SQL statements | 15 | 15 | 24 | 24 |
+| Returned rows | 13 | 13 | 76 | 76 |
+| Response bytes | 5989 | 5989 | 11557 | 11557 |
+| `HashDiff-Done` | 2 | 1 | 20 | 10 |
+| `Hashmap-Build-Done` | 4 | 2 | 40 | 20 |
+| `SnapshotScan-Done` | 8 | 4 | 80 | 40 |
+| `GetRelations-Done` | 1 | 1 | 10 | 10 |
+
+Use `--modes summary --server-log /path/to/mo.json.log` with the profiler above
+to compare these server versions. This optimization reduces server work;
+the SQL interface and client round trips are unchanged. The local median
+improved by about 13% for one table and 15% for ten tables.
+
+A separate 20,000-row check updated 12,000 source rows and made the same
+updates to 6,000 destination rows. Both versions reported exactly 6,000
+source updates and zero conflicts. One measured merge changed from 1291 ms
+to 693 ms. Three subsequent no-op merges returned all-zero summaries and
+kept the row count and sum unchanged; their median changed from 175 ms to
+186 ms, so this run shows no no-op latency improvement. Both versions already
+need only one diff pass for a no-op. These small samples do not establish
+throughput or tail latency.
 
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
