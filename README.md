@@ -1126,6 +1126,81 @@ plain, table-summary, and database interfaces, checking row values, summary
 counts, and absence of leaked stages. The Branch/hashmap/snapshot-join regression
 suite passes as well.
 
+MO commit `3f54a1a83` applies small integer MERGE updates with
+`UPDATE target JOIN (VALUES ROW(...), ...) ... SET ...`, avoiding UPDATE staging.
+Every projected writable value and matching primary-key component must be an
+integer. Explicit casts preserve signedness, uint64 limits, and all-NULL columns.
+Each update batch is limited to 128 rows and 512 values, counting both writable
+columns and the repeated matching keys. Larger batches retain the original raw
+VALUES for staging; unsupported types and keyless updates retain their existing
+paths. PICK and portable SQL output are unchanged.
+
+For an eligible UPDATE-only merge with one batch, server-generated apply SQL
+falls from five statements (initial DROP, CREATE, stage load, UPDATE, final DROP)
+to one UPDATE. INSERT plus eligible UPDATE needs no stages; DELETE still uses
+its stage. Batches may switch between inline and staged updates within one
+merge, preserving clear-before-reuse semantics. Both paths use the same
+transaction and retryable statement executor. Client SQL counts do not change.
+
+A comparison on 2026-10-25 used baseline `272d41114`, final build `3f54a1a83`,
+and the same clean adapter `39a583f`. It used the profiler command above with
+1,000 rows/table, 100 source updates plus one insert, 50 conflicting destination
+updates, and the `ours` policy: 50 updates/table are applied. Each server ran
+three repetitions per interface/table count, alternating interfaces, with the
+baseline measured first. Medians in ms:
+
+| Interface / tables | Client merge before → after | Server merge before → after | Stage init + cleanup before → after |
+| --- | ---: | ---: | ---: |
+| Table summary / 1 | 212 → 169 | 47 → 35 | 19 → 0 |
+| Database / 1 | 183 → 195 | 50 → 38 | 20 → 0 |
+| Table summary / 10 | 711 → 510 | 543 → 343 | 200 → 0 |
+| Database / 10 | 633 → 438 | 483 → 287 | 207 → 0 |
+
+Ten-table client latency fell about 28%/31% for table/database MERGE. One-table
+database client latency increased about 7%, despite reduced server time. All
+final optimized runs recorded zero staging initialization/cleanup time, and
+all 24 before/after runs checked conflicts and merge/revert/reset data with
+complete server timings. Client merge statements remain 15 for one table and
+24/15 for ten-table table/database modes. These are small local diagnostic
+samples, not throughput or tail-latency guarantees.
+
+The batch limits avoid the parsing cost of large typed VALUES expressions.
+An uncapped prototype slowed a 90,000-row update from 5.94 s to 10.36 s, so large
+updates keep staging. A separate bulk check on the final build used table MERGE
+with ACCEPT, updated every source row, and made no destination changes. Three
+fresh database pairs per size/build produced these client medians in ms:
+
+| Updated rows | Baseline `272d41114` | Final `3f54a1a83` |
+| --- | ---: | ---: |
+| 1,000 | 138 | 84 |
+| 10,000 | 754 | 865 |
+| 90,000 | 5939 | 5700 |
+
+All these final bulk batches use staging. The 10,000-row median increased 15%;
+these samples do not establish a bulk-update speedup. To reproduce this workload,
+use a fresh database pair for each repetition, change the series upper bound for
+each size, and time only the MERGE statement over the client connection:
+
+```sql
+CREATE DATABASE bulk_dst;
+CREATE TABLE bulk_dst.t(id INT PRIMARY KEY, v INT);
+INSERT INTO bulk_dst.t SELECT result,result FROM generate_series(1,90000) g;
+DATA BRANCH CREATE DATABASE bulk_src FROM bulk_dst;
+UPDATE bulk_src.t SET v=v+1;
+DATA BRANCH MERGE bulk_src.t INTO bulk_dst.t WHEN CONFLICT ACCEPT OUTPUT SUMMARY;
+SELECT COUNT(*),SUM(v<>id+1) FROM bulk_dst.t;
+DROP DATABASE bulk_src;
+DROP DATABASE bulk_dst;
+```
+
+Regression coverage checks row/value limits, inline batches between staged
+loads, failures and cancellation, integer boundaries, composite keys, NULL,
+generated/default columns, source additions, unique constraints, explicit
+rollback, and database rollback on a later-table failure. The 90,000-row
+repeated-update and DECIMAL stage-reuse cases also pass. Eighteen live checks
+across plain/table-summary/database MERGE verify data, counts, complete timings,
+and cleanup, including zero staging time for small integer updates.
+
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
