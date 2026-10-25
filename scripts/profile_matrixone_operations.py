@@ -6,11 +6,12 @@
 Creates uniquely named scratch databases and removes them in finally blocks.
 Setup/seed/cleanup and connection handshakes are excluded. Counts cover all
 COM_QUERY calls, including queries made directly through cursors. Received
-bytes include MySQL packet headers. Server-internal SQL/scans are not counted.
+bytes include MySQL packet headers. These client counts exclude internal SQL/scans.
 Run against a disposable local server for comparable latency measurements.
 With --server-log, also count DataBranch events appended to a local JSON log
-at INFO level. This requires an exclusive server and no log rotation during
-the run; HashDiff events count internal diff passes, not individual SQL.
+at INFO level, plus logged LCA SQL in server_lca_probe_statements. This requires
+an exclusive server with no log rotation; HashDiff events count internal diff
+passes, not individual SQL.
 Instrumented servers also report exclusive merge phase wall times. Request
 totals include table timings and transaction finish; do not add table totals
 again. Missing or incomplete timing logs are explicitly marked in the JSON.
@@ -146,6 +147,7 @@ class SQLTrace:
         if isinstance(getattr(result, "value", None), dict) and "merge_summary" in result.value:
             measurement["merge_summary"] = result.value["merge_summary"]
         if self.server_log:
+            lca_probes = 0
             events = Counter()
             records = []
             with self.server_log.open("rb") as log:
@@ -160,9 +162,17 @@ class SQLTrace:
                     event = record.get("msg", "")
                     if not isinstance(event, str):
                         continue
+                    sql = record.get("sql")
+                    if (event == "sql_executor exec" and isinstance(sql, str)
+                            and sql.startswith("select pks.`__mo_data_branch_ordinal`")
+                            and " as lca right join (values " in sql):
+                        lca_probes += 1
                     if event.startswith("DataBranch-"):
                         events[event] += 1
                         records.append(record)
+            # Count executor log events, not client requests or duplicate SQL
+            # text from other loggers. Requires the same exclusive INFO log.
+            measurement["server_lca_probe_statements"] = lca_probes
             measurement["server_events"] = dict(events)
             if operation == "merge":
                 expected = sum(r["error"] is None and r["sql"].lstrip().upper().startswith("DATA BRANCH MERGE ")

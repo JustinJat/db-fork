@@ -929,6 +929,12 @@ test server configured for INFO JSON logging. The report counts appended
 internal diff passes, not total engine SQL statements. Log rotation and
 other clients make this attribution invalid.
 
+The same option records `server_lca_probe_statements`: matching
+`sql_executor exec` records for the branch engine's LCA snapshot SELECTs during
+each operation. It excludes earlier log entries, duplicate SQL text emitted by
+other loggers, reader fallback scans, and other internal SQL. This is separate
+from the client `statements` count; without `--server-log`, the field is absent.
+
 With the local merge timing change (`026daa338` on
 [`branchbench-opt`](https://github.com/zuyu/matrixone/tree/branchbench-opt)), the
 same `--server-log` option adds `server_merge_timing` to each merge measurement:
@@ -1200,6 +1206,62 @@ rollback, and database rollback on a later-table failure. The 90,000-row
 repeated-update and DECIMAL stage-reuse cases also pass. Eighteen live checks
 across plain/table-summary/database MERGE verify data, counts, complete timings,
 and cleanup, including zero staging time for small integer updates.
+
+MO commit `322c08ee1` coalesces small serial LCA probes across hash shards.
+Each side's tombstone keys share one query when there are at most 1,024 keys
+and they fit the existing memory-derived batch limit. Source and destination
+still probe their respective ancestor snapshot timestamps separately. Larger
+inputs, tighter memory limits, and parallel consumers keep the per-shard path.
+The change benefits serial branch operations, including MERGE, without changing
+the SQL interface or client round trips.
+
+The larger batches exposed a mixed-update bug: ACCEPT can restore rows deleted
+on the destination and update other rows in the same batch. The old retained-row
+filter removed the ordinary updates instead of retaining them. The commit also
+corrects that filter. Regression tests cover integer and DECIMAL apply paths,
+composite keys, equal changes, all three MERGE interfaces, explicit rollback,
+commit, and repeated no-op merge. A separate unit regression checks one probe
+instead of ten, the 1,024-key boundary, memory limits, missing ancestor rows,
+query/delivery failures, and cancellation.
+
+A fresh comparison on 2026-10-25 used baseline `3f54a1a83`, optimized server
+`322c08ee1`, and the same clean adapter `8e3151d`. It used the profiler command
+above with 1,000 rows/table, 100 source updates plus one insert, 50 conflicting
+destination updates, and `ours`. Each server ran three repetitions per
+interface/table count, alternating interfaces, with the baseline first.
+Medians in ms; query counts are actual executor log entries:
+
+| Interface / tables | Client merge before → after | Server merge before → after | Diff before → after | LCA probe SQL before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Table summary / 1 | 160 → 156 | 27 → 22 | 12 → 7 | 20 → 2 |
+| Database / 1 | 180 → 171 | 30 → 27 | 15 → 7 | 20 → 2 |
+| Table summary / 10 | 541 → 331 | 376 → 206 | 202 → 56 | 200 → 20 |
+| Database / 10 | 412 → 275 | 283 → 140 | 179 → 48 | 200 → 20 |
+
+Ten-table client latency fell about 39%/33% for table/database MERGE. Their
+diff phases fell about 72%/73%, while logged LCA queries fell 90%. One-table
+client improvements were only 3%/5%. Client statement counts remain 15 for one
+table and 24/15 for ten-table table/database modes. All 24 runs checked merge,
+revert, reset, and conflict counts, and had complete server timing records.
+The new profiler field makes the internal query reduction visible in subsequent
+JSON output; the comparison above counted the same executor records within the
+recorded MERGE request intervals.
+
+The separate all-row UPDATE workload and SQL recipe above produced these
+three-run client medians. These measurements do not show a bulk-update speedup:
+
+| Updated rows | Baseline `3f54a1a83` | Optimized `322c08ee1` |
+| --- | ---: | ---: |
+| 1,000 | 120 | 124 |
+| 10,000 | 748 | 894 |
+| 90,000 | 5875 | 6176 |
+
+The 10,000/90,000-row cases keep per-shard probes. These small local samples
+support the reduction in queries for small change sets, not a universal latency
+or throughput improvement. The Branch/hashmap/snapshot-join Go regression suite
+and the 90,000-row repeated-merge tests pass. Eighteen live checks verify all
+three interfaces, data/counts, complete timings, expected probe counts, and
+absence of leaked stages.
 
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary

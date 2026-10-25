@@ -92,3 +92,32 @@ def test_trace_reads_only_operation_logs_and_ignores_rejected_probes(tmp_path):
     assert result["server_merge_timing"]["total_ms"] == 7
     assert result["server_events"]["DataBranch-Merge-Request-Timing"] == 1
     assert result["merge_summary"] == "native"
+
+
+def test_trace_counts_only_current_executor_lca_queries(tmp_path):
+    log = tmp_path / "mo.log"
+    sql = ("select pks.`__mo_data_branch_ordinal`, lca.`id` from `db`.`t`{MO_TS=10}"
+           " as lca right join (values row(0,1)) as pks(ordinal,id) on lca.id=pks.id")
+    probe = {"msg": "sql_executor exec", "sql": sql}
+    log.write_text(json.dumps(probe) + "\n")  # previous operation must be excluded
+    trace = SQLTrace(SimpleNamespace(), log)
+
+    def diff():
+        with log.open("a") as out:
+            for record in [probe, probe,
+                           {"msg": "frontend exec", "sql": sql},
+                           {"msg": "sql_executor exec", "sql": "select 1"},
+                           {"msg": "sql_executor exec", "sql": 42},
+                           {"msg": "DataBranch-HashDiff-Done"}]:
+                out.write(json.dumps(record) + "\n")
+        return SimpleNamespace(ok=True)
+
+    _, result = trace.measure("diff", diff)
+    assert result["server_lca_probe_statements"] == 2
+    assert result["statements"] == 0  # internal probes are separate from client SQL
+    assert result["server_events"] == {"DataBranch-HashDiff-Done": 1}
+
+    _, result = trace.measure("log", lambda: SimpleNamespace(ok=True))
+    assert result["server_lca_probe_statements"] == 0
+    _, result = SQLTrace(SimpleNamespace()).measure("log", lambda: SimpleNamespace(ok=True))
+    assert "server_lca_probe_statements" not in result
