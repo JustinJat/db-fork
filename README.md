@@ -935,6 +935,13 @@ each operation. It excludes earlier log entries, duplicate SQL text emitted by
 other loggers, reader fallback scans, and other internal SQL. This is separate
 from the client `statements` count; without `--server-log`, the field is absent.
 
+`server_branch_dag_statements` counts the branch engine's full, unlocked
+`mo_branch_metadata` graph SELECTs in the same operation log interval. It
+excludes `FOR UPDATE` publication checks and duplicate text from other loggers.
+It measures graph reads, separately from the LCA row probes above, and is absent
+without `--server-log`. Both counters require the internal executor's INFO logs;
+they are not a count of all internal SQL.
+
 With the local merge timing change (`026daa338` on
 [`branchbench-opt`](https://github.com/zuyu/matrixone/tree/branchbench-opt)), the
 same `--server-log` option adds `server_merge_timing` to each merge measurement:
@@ -1350,6 +1357,67 @@ suite and existing 90,000-row stage-reuse/repeated-merge regressions pass.
 Eighteen checks against the built server cover plain, table-summary, and
 database MERGE, data/counts, complete timings, and absence of leaked stages;
 small eligible delete and mixed workloads record zero staging time.
+
+MO commit `d33aa9d38` loads and builds the branch graph once per database
+DIFF/MERGE statement, reusing it across the serial table loop. This applies only
+to the server's private transaction, which already holds the lineage lifecycle
+gate. Explicit user transactions retain their per-table reads. The graph is
+loaded after authorization, lazily at the first table that needs it, and is
+never kept across statements or on a session. Empty databases and DIFFs with
+only one-sided tables issue no graph query. Table-level interfaces are unchanged.
+
+For ten paired tables this reduces graph SELECTs from ten to one for both
+database DIFF and MERGE. It does not change LCA row probes, client SQL counts,
+conflict policy, or transaction boundaries. `server_branch_dag_statements` makes
+this reduction visible in profiler JSON; MERGE's `lineage` phase includes the
+shared load in the first table's time and only graph traversal in later tables.
+
+A comparison on 2026-10-25 used baseline `91e759ddb`, built server `d33aa9d38`,
+and the unchanged `cb09515` adapter with the new profiler counter. Both result
+files record a dirty tracked tree for that instrumentation change. The default
+UPDATE workflow used 1,000 rows/table, 100 source updates plus one insert,
+50 conflicting destination updates, and `ours`. Each server ran three
+repetitions per interface/table count, alternating interfaces, baseline first.
+Medians in ms:
+
+| Interface / tables | Client MERGE before → after | Server MERGE before → after | Lineage before → after | MERGE graph SELECTs before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Table summary / 1 | 158 → 135 | 17 → 23 | 1.1 → 1.1 | 1 → 1 |
+| Database / 1 | 155 → 149 | 22 → 23 | 1.8 → 1.1 | 1 → 1 |
+| Table summary / 10 | 349 → 372 | 199 → 217 | 14.0 → 16.2 | 10 → 10 |
+| Database / 10 | 349 → 311 | 184 → 152 | 18.3 → 2.1 | 10 → 1 |
+
+Ten-table database MERGE's lineage phase fell about 89%, and its client median
+fell about 11%. The unoptimized table-level control became slower. Database
+DIFF also reduced graph queries from ten to one, but its client median rose
+from 90 to 100 ms (one-table: 22 to 29 ms). These small local samples demonstrate
+the query reduction, not a general DIFF latency improvement or a throughput
+guarantee. All 24 workflow runs checked conflicts and merge/revert/reset data
+with complete MERGE timings. Ten-table database MERGE still uses 15 client
+statements and 20 LCA row probes; database DIFF still uses 9 client statements.
+
+Reproduce against each build separately, with its own INFO JSON log and output:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --reps 3 \
+  --modes summary database --server-log /tmp/mo.json.log \
+  --out /tmp/mo-dag-profile.json
+```
+
+Regression checks cover empty graphs, failures/cancellation, system-account
+context restoration, and fresh metadata for a new request. The database SQL
+regression uses opposite fork directions, then an ALTER generation and a new
+clone edge on the same connection; DIFF, SKIP/ACCEPT, rollback, and no-op repeat
+results must remain correct. Existing Branch/hashdiff/lifecycle/snapshot tests
+also pass. The profiler test checks current-operation attribution and excludes
+locking queries, malformed entries, and duplicate loggers.
+Eleven checks against the built server verify both database operations with
+current/snapshot endpoints and private/explicit transactions, plus empty and
+one-sided inputs. Two paired tables issue one graph query privately and two
+inside BEGIN; empty/one-sided operations issue zero. Snapshot checks include
+an ALTER and a dropped source table after the snapshot, and explicit MERGE
+rollback restores both destination tables.
 
 In a separate traced run of the 10-table UPDATE workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary

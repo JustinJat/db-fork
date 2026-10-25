@@ -9,7 +9,8 @@ COM_QUERY calls, including queries made directly through cursors. Received
 bytes include MySQL packet headers. These client counts exclude internal SQL/scans.
 Run against a disposable local server for comparable latency measurements.
 With --server-log, also count DataBranch events appended to a local JSON log
-at INFO level, plus logged LCA SQL in server_lca_probe_statements. This requires
+at INFO level, plus logged LCA SQL in server_lca_probe_statements and branch
+graph reads in server_branch_dag_statements. This requires
 an exclusive server with no log rotation; HashDiff events count internal diff
 passes, not individual SQL.
 Instrumented servers also report exclusive merge phase wall times. Request
@@ -150,6 +151,7 @@ class SQLTrace:
             measurement["merge_summary"] = result.value["merge_summary"]
         if self.server_log:
             lca_probes = 0
+            branch_dag_reads = 0
             events = Counter()
             records = []
             with self.server_log.open("rb") as log:
@@ -169,12 +171,17 @@ class SQLTrace:
                             and sql.startswith("select pks.`__mo_data_branch_ordinal`")
                             and " as lca right join (values " in sql):
                         lca_probes += 1
+                    if (event == "sql_executor exec" and sql ==
+                            "select table_id, clone_ts, p_table_id, level, table_deleted "
+                            "from mo_catalog.mo_branch_metadata"):
+                        branch_dag_reads += 1
                     if event.startswith("DataBranch-"):
                         events[event] += 1
                         records.append(record)
             # Count executor log events, not client requests or duplicate SQL
             # text from other loggers. Requires the same exclusive INFO log.
             measurement["server_lca_probe_statements"] = lca_probes
+            measurement["server_branch_dag_statements"] = branch_dag_reads
             measurement["server_events"] = dict(events)
             if operation == "merge":
                 expected = sum(r["error"] is None and r["sql"].lstrip().upper().startswith("DATA BRANCH MERGE ")

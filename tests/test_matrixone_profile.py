@@ -121,3 +121,31 @@ def test_trace_counts_only_current_executor_lca_queries(tmp_path):
     assert result["server_lca_probe_statements"] == 0
     _, result = SQLTrace(SimpleNamespace()).measure("log", lambda: SimpleNamespace(ok=True))
     assert "server_lca_probe_statements" not in result
+
+
+def test_trace_counts_only_current_unlocked_branch_graph_reads(tmp_path):
+    log = tmp_path / "mo.log"
+    sql = ("select table_id, clone_ts, p_table_id, level, table_deleted "
+           "from mo_catalog.mo_branch_metadata")
+    probe = {"msg": "sql_executor exec", "sql": sql}
+    log.write_text(json.dumps(probe) + "\n")
+    trace = SQLTrace(SimpleNamespace(), log)
+
+    def diff():
+        with log.open("a") as out:
+            for record in [probe, probe,
+                           {"msg": "frontend exec", "sql": sql},
+                           {"msg": "sql_executor exec", "sql": sql + " for update"},
+                           {"msg": "sql_executor exec", "sql": [sql]},
+                           {"msg": "DataBranch-HashDiff-Done"}]:
+                out.write(json.dumps(record) + "\n")
+        return SimpleNamespace(ok=True)
+
+    _, result = trace.measure("diff", diff)
+    assert result["server_branch_dag_statements"] == 2
+    assert result["server_lca_probe_statements"] == 0
+    assert result["statements"] == 0
+    _, result = trace.measure("log", lambda: SimpleNamespace(ok=True))
+    assert result["server_branch_dag_statements"] == 0
+    _, result = SQLTrace(SimpleNamespace()).measure("log", lambda: SimpleNamespace(ok=True))
+    assert "server_branch_dag_statements" not in result
