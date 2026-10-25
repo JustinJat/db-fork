@@ -1104,13 +1104,27 @@ and a database merge with 90,000 updates plus 85,000 deletes, exceeding the
 and committed results. Eighteen live cases across plain/table-summary/database
 MERGE check data, summaries, timings, and absence of leaked stages.
 
-A separate probe exposed an existing large repeated-merge failure, reproduced
-on baseline `5a2943202` as well as this change: seed 90,000 `(id,v)=(i,i)` rows,
+A separate probe exposed an existing large repeated-merge failure in
+`5a2943202` and `b9342f82a`: seed 90,000 `(id,v)=(i,i)` rows,
 fork the database, increment every source `v`, and merge with ACCEPT; increment
 every source `v` again, then repeat database MERGE with OUTPUT SUMMARY inside
-BEGIN. The second merge can fail with duplicate primary key error 1062. This
-case remains unresolved; the successful large rollback test above starts from
-an unmerged fork and does not establish that consecutive large merges work.
+BEGIN. The second merge could fail with duplicate primary key error 1062.
+
+MO commit `272d41114` fixes the underlying change-compaction bug. Removing an
+old tombstone could free the memory backing the iterator's primary key; a
+subsequent lookup could then lose the surviving deletion marker and classify
+an UPDATE as an INSERT. A reusable key buffer per shard now keeps that key
+valid throughout compaction. This adds no SQL statements and requires no
+adapter change.
+
+The deterministic regression clears freed allocator buffers and checks repeated
+updates, update-then-delete, and insert/update/delete histories. It fails on the
+old code and passes with the fix. The original 90,000-row SQL regression checks
+database-summary rollback and plain MERGE commit. Live checks on the built
+`272d41114` server also pass rollback, commit, and an unchanged repeat merge for
+plain, table-summary, and database interfaces, checking row values, summary
+counts, and absence of leaked stages. The Branch/hashmap/snapshot-join regression
+suite passes as well.
 
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
