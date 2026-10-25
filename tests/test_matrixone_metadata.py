@@ -19,11 +19,11 @@ def suite():
 def test_catalog_preserves_pk_order_and_column_defaults():
     s = suite()
     s._execute = Mock(return_value=[
-        ("t", "a", "int", "NO", None, 2),
-        ("t", "b", "int", "NO", None, 1),
-        ("t", "v", "varchar(8)", "YES", "'hello'", None),
-        ("t", "__mo_cpkey_col", "varchar", "NO", None, 1),
-        ("heap", "v", "int", "YES", None, None),
+        (0, "t", "a", "int", "NO", None, 2),
+        (0, "t", "b", "int", "NO", None, 1),
+        (0, "t", "v", "varchar(8)", "YES", "'hello'", None),
+        (0, "t", "__mo_cpkey_col", "varchar", "NO", None, 1),
+        (0, "heap", "v", "int", "YES", None, None),
     ])
     catalog = s._catalog("MixedCase")
     assert catalog["t"]["pk"] == ["b", "a"]
@@ -33,7 +33,75 @@ def test_catalog_preserves_pk_order_and_column_defaults():
     ]
     assert catalog["heap"]["pk"] == []
     assert s._execute.call_count == 1
-    assert s._execute.call_args.args[1] == ("MixedCase", r"\_bb\_%")
+    assert s._execute.call_args.args[1] == ("MixedCase", r"\_bb\_%", "MixedCase")
+
+
+def test_catalogs_keep_same_named_tables_and_empty_databases_separate():
+    s = suite()
+    s._execute = Mock(return_value=[
+        (0, "t", "id", "int", "NO", None, 1),
+        (0, "t", "v", "int", "YES", None, None),
+        (1, "t", "id", "bigint", "NO", None, 1),
+        (1, "t", "v", "varchar(8)", "YES", "'hello'", None),
+    ])
+    ours, theirs, empty = s._catalogs("Ours", "Theirs", "Empty")
+    assert ours["t"]["columns"][1] == ("v", "int", "YES", None)
+    assert theirs["t"]["columns"][1] == ("v", "varchar(8)", "YES", "'hello'")
+    assert ours["t"]["pk"] == theirs["t"]["pk"] == ["id"]
+    assert empty == {}
+    s._execute.assert_called_once()
+
+
+@pytest.mark.parametrize("dbs", [("MixedCase", "mixedcase"), ("quoted'`\\%_name", "other")])
+def test_catalogs_bind_names_and_keep_alias_results_independent(dbs):
+    s = suite()
+    s._execute = Mock(return_value=[
+        (i, "t", "id", "int", "NO", None, 1) for i in range(2)
+    ])
+    first, second = s._catalogs(*dbs)
+    sql, args = s._execute.call_args.args
+    assert args == (*dbs, r"\_bb\_%", *dbs)
+    assert all(db not in sql for db in dbs)
+    first["t"]["columns"].append(("extra", "int", "YES", None))
+    first["t"]["pk"].clear()
+    assert second == {"t": {"columns": [("id", "int", "NO", None)], "pk": ["id"]}}
+
+
+def test_no_requested_catalogs_issue_no_sql():
+    s = suite()
+    s._execute = Mock()
+    assert s._catalogs() == []
+    s._execute.assert_not_called()
+
+
+def test_reconcile_fetches_both_missing_catalogs_together():
+    s = suite()
+    s._catalogs = Mock(return_value=[{}, {}])
+    s._catalog = Mock(side_effect=AssertionError("unexpected separate read"))
+    assert s._reconcile_schema("ours", mo._State("theirs")) == {
+        "added_tables": [], "added_columns": [],
+    }
+    s._catalogs.assert_called_once_with("ours", "theirs")
+
+
+@pytest.mark.parametrize("missing", ["ours", "theirs"])
+def test_reconcile_preserves_a_supplied_empty_catalog(missing):
+    s = suite()
+    s._catalogs = Mock(side_effect=AssertionError("must preserve supplied metadata"))
+    s._catalog = Mock(return_value={})
+    s._reconcile_schema("ours", mo._State("theirs"),
+                        None if missing == "ours" else {}, None if missing == "theirs" else {})
+    s._catalog.assert_called_once_with(missing)
+
+
+def test_combined_catalog_failure_propagates_before_schema_writes():
+    s = suite()
+    error = pymysql.OperationalError(1105, "catalog unavailable")
+    s._execute = Mock(side_effect=error)
+    with pytest.raises(pymysql.OperationalError, match="catalog unavailable"):
+        s._reconcile_schema("ours", mo._State("theirs"))
+    s._execute.assert_called_once()
+    assert s._execute.call_args.args[0].startswith("SELECT ")
 
 
 def test_schema_conflict_is_detected_before_any_ddl():
@@ -70,12 +138,15 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
     def execute(sql, args=None):
         queries.append((sql, args))
         if "information_schema.columns c" in sql:
-            cols = [("id", "int", "NO", None, 1), ("v", "int", "YES", None, None)]
-            # A new source column appears between two merge calls. The
-            # second operation must discover it without recreating the suite.
-            if args[0] == "theirs" and version[0]:
-                cols.append(("extra", "int", "YES", "7", None))
-            return [(f"t{i}", *col) for i in range(table_count) for col in cols]
+            assert args == ("ours", "theirs", r"\_bb\_%", "ours", "theirs")
+            result = []
+            for index in range(2):
+                cols = [("id", "int", "NO", None, 1), ("v", "int", "YES", None, None)]
+                # A source column added between calls must be discovered.
+                if index == 1 and version[0]:
+                    cols.append(("extra", "int", "YES", "7", None))
+                result.extend((index, f"t{i}", *col) for i in range(table_count) for col in cols)
+            return result
         if sql.startswith("SHOW CREATE TABLE"):
             return [("t", "CREATE TABLE `t` (`id` int, `v` int, `extra` int DEFAULT 7)")]
         if sql.startswith("DATA BRANCH MERGE DATABASE"):
@@ -104,7 +175,7 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
     second = s._merge_impl(Ref("ours"), Ref("theirs"), "merge again")
     assert second["schema_changes"]["added_columns"] == [f"t{i}.extra" for i in sorted(range(table_count), key=lambda i: f"t{i}")]
     catalog_queries = [sql for sql, _ in queries if "information_schema.columns c" in sql]
-    assert len(catalog_queries) == 4  # exactly two per operation, at either scale
+    assert len(catalog_queries) == 2  # one combined read per operation, at either scale
     assert sum(sql.startswith("ALTER TABLE") for sql, _ in queries) == table_count
     assert sum(sql.startswith("DATA BRANCH MERGE") for sql, _ in queries) == (
         2 if mode == "database" else 2 * table_count)

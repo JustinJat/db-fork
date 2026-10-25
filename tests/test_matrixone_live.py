@@ -61,6 +61,45 @@ def test_bulk_catalog_matches_table_metadata_and_indexes_existing_logs(suite):
     assert any(r[2] == "_bb_commit_id" and r[1] == 1 for r in indexes)
 
 
+def test_combined_catalogs_preserve_identity_filtering_and_refresh(suite):
+    suite.exec([
+        "CREATE TABLE composite_pk (a INT, b INT, v VARCHAR(8) DEFAULT 'x', PRIMARY KEY (b,a))",
+        "CREATE TABLE `quoted``table` (`quoted``column` INT PRIMARY KEY)",
+        "CREATE TABLE _bb_private (id INT PRIMARY KEY)",
+        "CREATE VIEW catalog_view AS SELECT id FROM t",
+    ], refs=["main"], raise_on_error=True)
+    assert suite.commit("main", "catalog base").ok
+    branch = suite.branch("catalog_source", "main")
+    assert branch.ok, branch.error
+    source = suite._db_for("catalog_source")
+    empty = DB + "_catalog_empty"
+    suite._execute(f"CREATE DATABASE `{empty}`")
+    try:
+        ours, theirs, blank, alias = suite._catalogs(DB.upper(), source, empty, DB)
+        assert ours == theirs == alias
+        assert blank == {}
+        assert ours is not alias and ours["t"] is not alias["t"]
+        assert "catalog_view" not in ours and "_bb_private" not in ours
+        assert ours["composite_pk"]["pk"] == ["b", "a"]
+        assert ours["quoted`table"]["pk"] == ["quoted`column"]
+        for db, catalog in ((DB, ours), (source, theirs)):
+            assert sorted(catalog) == sorted(suite._tables(db))
+            for table, spec in catalog.items():
+                assert spec["columns"] == suite._columns(db, table)
+                assert spec["pk"] == suite._pk(db, table)
+
+        suite.exec(["ALTER TABLE t ADD COLUMN extra INT DEFAULT 7",
+                    "CREATE TABLE source_only (id BIGINT PRIMARY KEY)"],
+                   refs=["catalog_source"], raise_on_error=True)
+        new_ours, new_theirs = suite._catalogs(DB, source)
+        assert new_ours == ours
+        assert "extra" not in {c[0] for c in theirs["t"]["columns"]}
+        assert "extra" in {c[0] for c in new_theirs["t"]["columns"]}
+        assert "source_only" not in new_ours and "source_only" in new_theirs
+    finally:
+        suite._execute(f"DROP DATABASE `{empty}`")
+
+
 @needs_simulated
 def test_implementation_summary():
     impl = matrixone.MatrixOneToolSuite.implementation()

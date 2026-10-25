@@ -1419,6 +1419,72 @@ inside BEGIN; empty/one-sided operations issue zero. Snapshot checks include
 an ALTER and a dropped source table after the snapshot, and explicit MERGE
 rollback restores both destination tables.
 
+The adapter now reads both MERGE endpoint catalogs in one SQL statement before
+schema reconciliation, including on the table-summary and legacy paths. A small
+derived table tags each requested database with an input position; SQL performs
+the case-insensitive name match, so identical table names, case aliases, and
+empty catalogs stay separate. A constant schema filter also lets the planner
+restrict the information-schema joins. Columns, defaults, and primary-key index
+order retain their existing meanings. Database names are bound parameters.
+
+Schema reconciliation uses the same combined read when neither catalog was
+supplied, including during rebase. Supplied catalogs are preserved. Nothing is
+cached between operations: a later schema change or branch generation is read
+again, and historical source tables still get their visibility checks. The
+post-merge schema fingerprint is still read afresh for the commit log; it is
+not inferred from the pre-merge catalogs.
+
+For the profiler's workload, every MERGE mode saves one client statement:
+
+| Interface | 1 table before → after | 10 tables before → after |
+| --- | ---: | ---: |
+| Legacy | 19 → 18 | 64 → 63 |
+| Table summary | 15 → 14 | 24 → 23 |
+| Database | 15 → 14 | 15 → 14 |
+
+Measured on 2026-10-25 against the same running `d33aa9d38` server, with the
+clean `ccc50f3` adapter as baseline and this catalog change applied afterward.
+The after JSON records the baseline HEAD with `adapter_dirty=true`; the source
+change is the one described here, and comparison artifacts include its source
+hash. The default UPDATE workflow used 1,000 rows/table, 100 source updates plus
+one insert, 50 destination updates, and `ours`. Each adapter ran three
+repetitions per mode/table count, alternating mode order, baseline first.
+Medians in ms; catalog time is the per-run sum of the two old queries or the
+single new query, excluding the later fingerprint:
+
+| Interface / tables | Client MERGE before → after | Catalog queries before → after | Server MERGE before → after |
+| --- | ---: | ---: | ---: |
+| Legacy / 1 | 203 → 165 | 76 → 29 | 24 → 23 |
+| Table summary / 1 | 181 → 139 | 96 → 53 | 21 → 23 |
+| Database / 1 | 157 → 134 | 74 → 30 | 24 → 23 |
+| Legacy / 10 | 806 → 803 | 76 → 32 | 212 → 220 |
+| Table summary / 10 | 373 → 370 | 56 → 54 | 208 → 237 |
+| Database / 10 | 285 → 245 | 58 → 30 | 148 → 156 |
+
+The ten-table database client median fell about 14%; ten-table legacy and
+table-summary totals were essentially unchanged. These are small local samples,
+not a general latency or throughput guarantee. All 36 workflows checked
+conflicts and merge/revert/reset data with complete server MERGE timings. Each
+after merge issued one combined catalog query and still issued one fresh
+fingerprint query. Returned row counts were unchanged; native/legacy execution
+path reporting retained its existing values.
+
+To reproduce, use the same server build and run each adapter revision separately:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --reps 3 \
+  --modes legacy summary database --server-log /tmp/mo.json.log \
+  --out /tmp/mo-catalog-profile.json
+```
+
+This step changes only the adapter; measurements use server `d33aa9d38` for both
+versions. Correctness coverage includes metadata isolation, case aliases, empty
+databases, composite key order, defaults, quoted names, filtering views and
+bookkeeping tables, schema refresh, and error propagation before any schema
+write. All 104 MatrixOne adapter tests pass, including live merge/rebase,
+snapshot refs, custom resolvers, conflicts, reset, and revert.
+
 In a separate traced run of the 10-table UPDATE workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation

@@ -26,7 +26,7 @@ def suite(monkeypatch, tmp_path):
     s._relation = Mock(return_value=("theirs", "ours", {"prev_db": "ours", "prev_snap": "base"}))
     catalog = {t: {"columns": [("id", "int", "NO", None), ("v", "int", "YES", None)],
                    "pk": ["id"]} for t in ("a", "b")}
-    s._catalog = Mock(return_value=catalog)
+    s._catalogs = Mock(return_value=[catalog, catalog])
     s._readable = Mock(return_value=True)
     s._summary = Mock(return_value=((0, 0, 1), (0, 0, 0)))
     s._head = Mock(return_value={"id": "c", "kind": "commit", "snap": "s", "db": "ours"})
@@ -137,7 +137,7 @@ def test_snapshot_readability_is_checked_once_per_source_table(suite):
 
 
 def test_empty_merge_does_not_claim_a_native_request(suite):
-    suite._catalog.return_value = {}
+    suite._catalogs.return_value = [{}, {}]
     suite._execute = server("database")
     result = suite.merge("main", "feature")
     assert result.ok

@@ -684,34 +684,51 @@ class MatrixOneToolSuite(DBToolSuite):
     # ------------------------------------------------------------------
 
     def _catalog(self, db: str) -> dict:
-        """Read the current database's table/column/PK metadata in one query.
+        """Read one current database's table/column/PK metadata."""
+        return self._catalogs(db)[0]
 
-        Callers own this per-operation dictionary. Never retain it across
+    def _catalogs(self, *dbs: str) -> list[dict]:
+        """Read current catalogs together, in input order, with one query.
+
+        Callers own these per-operation dictionaries. Never retain them across
         operations: another worker can change the schema or rebase a branch.
         PK order comes from the index, which need not match column order.
         Snapshot readability is checked separately by the caller.
         """
+        if not dbs:
+            return []
+        # Route rows by input position, leaving case-insensitive database-name
+        # matching to the server. Even aliases of one database get independent
+        # dictionaries, and a database with no data tables keeps its empty slot.
+        requested = " UNION ALL ".join(
+            f"SELECT {i} AS catalog_id, %s AS db_name" for i in range(len(dbs)))
+        schema_filter = ",".join("LOWER(%s)" for _ in dbs)
         rows = self._execute(
-            "SELECT c.table_name, c.column_name, c.column_type, c.is_nullable, "
+            "SELECT requested.catalog_id, c.table_name, c.column_name, c.column_type, c.is_nullable, "
             "c.column_default, s.seq_in_index "
             "FROM information_schema.columns c JOIN information_schema.tables t "
             "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
             "LEFT JOIN information_schema.statistics s ON s.table_schema = c.table_schema "
             "AND s.table_name = c.table_name AND s.column_name = c.column_name "
             "AND s.index_name = 'PRIMARY' "
-            "WHERE LOWER(c.table_schema) = LOWER(%s) AND t.table_type = 'BASE TABLE' "
-            "AND c.table_name NOT LIKE %s ORDER BY c.table_name, c.ordinal_position",
-            (db, META_PREFIX.replace("_", r"\_") + "%")) or []
-        out = {}
-        for table, name, ctype, nullable, default, pk_pos in rows:
-            spec = out.setdefault(table, {"columns": [], "pk": []})
+            f"JOIN ({requested}) requested ON LOWER(c.table_schema) = LOWER(requested.db_name) "
+            "WHERE t.table_type = 'BASE TABLE' AND c.table_name NOT LIKE %s "
+            # Keep a constant schema filter available to the planner as well
+            # as the join that assigns rows to requested catalogs.
+            f"AND LOWER(c.table_schema) IN ({schema_filter}) "
+            "ORDER BY requested.catalog_id, c.table_name, c.ordinal_position",
+            (*dbs, META_PREFIX.replace("_", r"\_") + "%", *dbs)) or []
+        out = [{} for _ in dbs]
+        for index, table, name, ctype, nullable, default, pk_pos in rows:
+            spec = out[index].setdefault(table, {"columns": [], "pk": []})
             if str(name).startswith("__mo_"):
                 continue
             spec["columns"].append((name, ctype, nullable, default))
             if pk_pos is not None:
                 spec["pk"].append((int(pk_pos), name))
-        for spec in out.values():
-            spec["pk"] = [name for _, name in sorted(spec["pk"])]
+        for catalog in out:
+            for spec in catalog.values():
+                spec["pk"] = [name for _, name in sorted(spec["pk"])]
         return out
 
     def _tables(self, db: str) -> list:
@@ -1034,8 +1051,11 @@ class MatrixOneToolSuite(DBToolSuite):
         """Give ours_db the tables and columns theirs has and it lacks; a
         differing primary key is a schema conflict (raised before any
         change)."""
-        ours_catalog = self._catalog(ours_db) if ours_catalog is None else ours_catalog
-        theirs_catalog = self._catalog(theirs.db) if theirs_catalog is None else theirs_catalog
+        if ours_catalog is None and theirs_catalog is None:
+            ours_catalog, theirs_catalog = self._catalogs(ours_db, theirs.db)
+        else:
+            ours_catalog = self._catalog(ours_db) if ours_catalog is None else ours_catalog
+            theirs_catalog = self._catalog(theirs.db) if theirs_catalog is None else theirs_catalog
         ours = set(ours_catalog)
         # The current catalog already establishes visibility at the head.
         # Historical refs still need a probe: a current table may not have
@@ -1307,8 +1327,7 @@ class MatrixOneToolSuite(DBToolSuite):
                        f"{theirs.db} and {ours_db} share no fork point: merging two-way")
         want_rows = callable(on_conflict)
         policy = "SKIP" if (want_rows or on_conflict == "ours") else "ACCEPT"
-        ours_catalog = self._catalog(ours_db)
-        theirs_catalog = self._catalog(theirs.db)
+        ours_catalog, theirs_catalog = self._catalogs(ours_db, theirs.db)
         readable_tables = {t for t in theirs_catalog if not theirs.snap or self._readable(theirs, t)}
         if MO_NATIVE_MERGE_AS_IS:
             # Native-only mode: the engine's merge as it is. A column the
