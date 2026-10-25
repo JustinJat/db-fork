@@ -1,0 +1,208 @@
+"""Count client SQL and received bytes for a reproducible branch workflow.
+
+    MO_PORT=6001 python -m scripts.profile_matrixone_operations \
+        --tables 1 10 --rows 1000 --changed 100 --reps 3 --out /tmp/mo-profile.json
+
+Creates uniquely named scratch databases and removes them in finally blocks.
+Setup/seed/cleanup and connection handshakes are excluded. Counts cover all
+COM_QUERY calls, including queries made directly through cursors. Received
+bytes include MySQL packet headers. Server-internal SQL/scans are not counted.
+Run against a disposable local server for comparable latency measurements.
+With --server-log, also count DataBranch events appended to a local JSON log
+at INFO level. This requires an exclusive server and no log rotation during
+the run; HashDiff events count internal diff passes, not individual SQL.
+"""
+
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+import subprocess
+import time
+import uuid
+
+from dblib import matrixone as mo
+from dblib import result_collector as rc
+from dblib.db_api import Ref
+
+
+class SQLTrace:
+    """Trace one buffered PyMySQL connection without changing the adapter."""
+
+    def __init__(self, conn, server_log=None):
+        self.conn = conn
+        self.server_log = Path(server_log) if server_log else None
+        self.records = []
+        self.received_bytes = 0
+
+    def __enter__(self):
+        self.query = self.conn.query
+        self.read_bytes = self.conn._read_bytes
+        self.conn.query = self._query
+        self.conn._read_bytes = self._read_bytes
+        return self
+
+    def __exit__(self, *exc):
+        self.conn.query = self.query
+        self.conn._read_bytes = self.read_bytes
+
+    def _read_bytes(self, *args, **kwargs):
+        data = self.read_bytes(*args, **kwargs)
+        self.received_bytes += len(data)
+        return data
+
+    def _query(self, sql, *args, **kwargs):
+        start, received = time.perf_counter(), self.received_bytes
+        error = None
+        try:
+            return self.query(sql, *args, **kwargs)
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            result = self.conn._result
+            text = sql.decode(self.conn.encoding) if isinstance(sql, bytes) else sql
+            self.records.append({
+                "sql": text,
+                "elapsed_ms": (time.perf_counter() - start) * 1000,
+                "received_bytes": self.received_bytes - received,
+                "returned_rows": len(result.rows or ()) if not error and result else 0,
+                "error": error,
+            })
+
+    def measure(self, operation, call):
+        self.records.clear()
+        offset = self.server_log.stat().st_size if self.server_log else None
+        start = time.perf_counter()
+        result = call()
+        elapsed = (time.perf_counter() - start) * 1000
+        if hasattr(result, "ok") and not result.ok:
+            raise RuntimeError(f"{operation}: {result.error}")
+        measurement = {
+            "operation": operation,
+            "elapsed_ms": elapsed,
+            "statements": len(self.records),
+            "received_bytes": sum(r["received_bytes"] for r in self.records),
+            "returned_rows": sum(r["returned_rows"] for r in self.records),
+            "statement_kinds": dict(Counter(" ".join(r["sql"].split()[:3]).upper()
+                                            for r in self.records)),
+            "queries": list(self.records),
+        }
+        if self.server_log:
+            events = Counter()
+            with self.server_log.open("rb") as log:
+                log.seek(offset)
+                for line in log:
+                    try:
+                        event = json.loads(line).get("msg", "")
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if event.startswith("DataBranch-"):
+                        events[event] += 1
+            measurement["server_events"] = dict(events)
+            if operation in ("diff", "merge") and not events["DataBranch-HashDiff-Done"]:
+                raise RuntimeError("No HashDiff events captured; use an exclusive server with INFO JSON logging")
+        return result, measurement
+
+
+def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
+    db = "bb_mop_" + uuid.uuid4().hex[:10]
+    suite = None
+    measurements = []
+    try:
+        backend.setup_database(db)
+        suite = backend.MatrixOneToolSuite.init_for_bench(rc.ResultCollector(), db)
+        suite._merge_summary_supported = False if mode == "legacy" else None
+        with suite.conn.cursor() as cur:
+            for i in range(table_count):
+                cur.execute(f"CREATE TABLE t{i}(id INT PRIMARY KEY, v INT)")
+                cur.executemany(f"INSERT INTO t{i} VALUES (%s,%s)", ((k, k) for k in range(rows)))
+
+        def check(result):
+            if not result.ok:
+                raise RuntimeError(result.error)
+            return result.value
+
+        with SQLTrace(suite.conn, server_log) as trace:
+            def measure(name, call):
+                result, data = trace.measure(name, call)
+                measurements.append(data)
+                return result.value if hasattr(result, "value") else result
+
+            base = check(suite.commit("main", "base"))
+            measure("create", lambda: suite.branch("feature", "main"))
+            # This is the adapter's branch switch, not a TCP handshake.
+            measure("connect", lambda: suite._connect_impl(Ref("feature")))
+            check(suite.exec([sql for i in range(table_count) for sql in (
+                f"UPDATE t{i} SET v=v+1 WHERE id < {changed}",
+                f"INSERT INTO t{i} VALUES ({rows}, {rows})",
+            )], refs=["feature"])[0])
+            feature = measure("commit", lambda: suite.commit("feature", "feature work"))
+            measure("log", lambda: suite.log("feature"))
+            check(suite.exec([f"UPDATE t{i} SET v=v+2 WHERE id < {changed // 2}"
+                              for i in range(table_count)], refs=["main"])[0])
+            check(suite.commit("main", "main work"))
+            measure("diff", lambda: suite.diff(f"main@{base}", f"feature@{feature}"))
+            merged = measure("merge", lambda: suite.merge("main", "feature", on_conflict="ours"))
+            if mode == "summary" and suite._merge_summary_supported is not True:
+                raise RuntimeError("Server does not support MERGE OUTPUT SUMMARY")
+            expected_conflicts = table_count * (changed // 2)
+            if merged["conflicts"] != expected_conflicts:
+                raise AssertionError((merged["conflicts"], expected_conflicts))
+            for i in range(table_count):
+                actual = suite._execute(f"SELECT COUNT(*), SUM(v) FROM t{i}")[0]
+                expected_sum = rows * (rows - 1) // 2 + rows + changed + changed // 2
+                if tuple(map(int, actual)) != (rows + 1, expected_sum):
+                    raise AssertionError((actual, expected_sum))
+            measure("revert", lambda: suite.revert("main", merged["hash"]))
+            measure("reset", lambda: suite.reset("main", base))
+            measure("delete", lambda: suite.delete("feature"))
+            for i in range(table_count):
+                actual = suite._execute(f"SELECT COUNT(*), SUM(v) FROM t{i}")[0]
+                if tuple(map(int, actual)) != (rows, rows * (rows - 1) // 2):
+                    raise AssertionError(actual)
+        return {"mode": mode, "tables": table_count, "rows_per_table": rows,
+                "changed_per_table": changed, "measurements": measurements}
+    finally:
+        if suite is not None:
+            suite.close_connection()
+        backend.drop_database(db)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tables", type=int, nargs="+", default=[1, 10])
+    parser.add_argument("--rows", type=int, default=1000)
+    parser.add_argument("--changed", type=int, default=100)
+    parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--modes", nargs="+", choices=["legacy", "summary"], default=["legacy", "summary"])
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--server-log", type=Path, help="local INFO JSON log of an exclusive test server")
+    args = parser.parse_args()
+    if min(args.tables) < 1 or args.reps < 1 or not 0 < args.changed <= args.rows:
+        parser.error("positive table/repetition counts and 0 < changed <= rows are required")
+    if not mo.MO_COUNT_CONFLICTS:
+        parser.error("conflict reporting must be enabled for correctness checks")
+    if args.server_log and not args.server_log.is_file():
+        parser.error("--server-log must name an existing file")
+    report = {
+        "adapter_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "endpoint": f"{mo.MO_HOST}:{mo.MO_PORT}",
+        "scope": "client COM_QUERY only; excludes setup, seed, cleanup, and handshake",
+        "runs": [],
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    for count in args.tables:
+        for rep in range(args.reps):
+            # Alternate order to reduce systematic first-run cache bias.
+            modes = args.modes if rep % 2 == 0 else list(reversed(args.modes))
+            for mode in modes:
+                run = run_once(count, args.rows, args.changed, mode, server_log=args.server_log)
+                run["repetition"] = rep
+                report["runs"].append(run)
+                args.out.write_text(json.dumps(report, indent=2) + "\n")
+                print(mode, count, {m["operation"]: m["statements"] for m in run["measurements"]}, flush=True)
+
+
+if __name__ == "__main__":
+    main()

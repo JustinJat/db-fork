@@ -818,6 +818,54 @@ same summary for the report):
 - `delete()` (native): `DATA BRANCH DELETE DATABASE` (`DROP DATABASE` after
   a restore, which leaves the database without branch metadata).
 
+To measure client SQL counts, returned rows, response bytes, and latency:
+
+```sh
+MO_PORT=6001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --reps 3 --out /tmp/mo-profile.json
+```
+
+The script creates and cleans up uniquely named scratch databases. It counts
+every client `COM_QUERY`, including direct cursor calls; setup, seeding,
+cleanup, and handshakes are excluded. `connect` means switching the adapter
+to an existing branch. `create` means branching from the current head.
+The workload changes 100 source rows and 50 target rows per table, inserts
+one source row, then merges with `ours`, reverts, and resets. Row counts and
+sums are checked after merge and reset. There are no schema migrations.
+Historical refs, chunked row replay, and different connection state can
+change the counts.
+
+Measured on 2026-10-25 against local MO commit `8fae23f97`, comparing original
+adapter `1ca34a3` with optimized adapter `c037fed` using native summaries:
+
+| Operation | Original: 1 table | Optimized: 1 table | Original: 10 tables | Optimized: 10 tables |
+| --- | ---: | ---: | ---: | ---: |
+| connect | 2 | 2 | 2 | 2 |
+| log | 2 | 2 | 2 | 2 |
+| delete | 3 | 3 | 3 | 3 |
+| commit | 5 | 5 | 5 | 5 |
+| create | 7 | 7 | 7 | 7 |
+| diff | 13 | 13 | 40 | 40 |
+| revert | 17 | 17 | 89 | 89 |
+| reset | 14 | 14 | 77 | 77 |
+| merge | 30 | 15 | 156 | 24 |
+
+For 10-table merge, median latency over three local runs changed from
+2874 ms to 1488 ms; returned rows from 1716 to 76; response bytes from
+77,359 to 11,557. On the same optimized adapter, disabling native summaries
+used 64 statements and had a 1927 ms median. These are small local diagnostic
+runs, not throughput or tail-latency measurements.
+
+For internal work, add `--server-log /path/to/mo.json.log` with an exclusive
+test server configured for INFO JSON logging. The report counts appended
+`DataBranch-*` events, including `DataBranch-HashDiff-Done`; these measure
+internal diff passes, not total engine SQL statements. Log rotation and
+other clients make this attribution invalid.
+In a separate traced run of the same 10-table workload, legacy merge emitted
+40 `HashDiff-Done` and 40 `GetRelations-Done` events; native summaries emitted
+20 and 10 respectively. Thus the initial implementation halves diff passes
+and shares relation resolution, while still doing two passes per table.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
