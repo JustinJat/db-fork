@@ -978,6 +978,57 @@ records retained; partial timings are never presented as a complete total.
 Without `--server-log`, no server timing field is added. This instrumentation
 does not itself claim a merge performance improvement.
 
+MO commit `500f53066` prepares each MERGE staging table at the first nonempty
+flush that consumes it, reuses it across batches, and cleans up only attempted
+stages. This covers plain MERGE, table summaries, and database MERGE. PICK and
+portable SQL output retain their previous staging behavior. Direct row updates
+and keyless inserts do not create an unused stage; an empty merge creates none.
+Stage preparation inside apply is charged only to `stage_init`, preserving the
+exclusive timing accounting above.
+
+For ordinary primary-key tables, the server's staging DDL count changes as
+follows. Each stage costs an initial DROP IF EXISTS, a CREATE TABLE AS SELECT,
+and a final DROP; target DML and stage-row clearing are additional statements.
+
+| Writes actually applied | Before (`026daa338`) | On demand (`500f53066`) |
+| --- | ---: | ---: |
+| INSERT only | 9 | 3 |
+| DELETE only | 9 | 3 |
+| Batched UPDATE only | 9 | 3 |
+| INSERT and batched UPDATE | 9 | 6 |
+| INSERT, DELETE, and batched UPDATE | 9 | 9 |
+
+A local comparison on 2026-10-25 used the same clean adapter (`b3adbf3`),
+1,000 rows/table, 100 source updates plus one insert/table, and 50 conflicting
+destination updates/table with the `ours` policy. Each server ran three
+repetitions per table count and interface, alternating interface order. The
+baseline server ran first, followed by the optimized server. Medians in ms:
+
+| Interface / tables | Client merge before → after | Server merge before → after | Stage init + cleanup before → after |
+| --- | ---: | ---: | ---: |
+| Table summary / 1 | 288 → 264 | 147 → 125 | 56 → 37 |
+| Database / 1 | 275 → 280 | 117 → 121 | 41 → 40 |
+| Table summary / 10 | 1429 → 1404 | 1283 → 1239 | 540 → 399 |
+| Database / 10 | 1397 → 1219 | 1264 → 1080 | 567 → 368 |
+
+The 10-table database merge reduced client latency by about 13% and combined
+staging time by 35% in this sample. The table-summary total improved only 2%,
+and the one-table database total increased 2%; these small runs do not establish
+a speedup for every workload. Each staging total is computed per run before
+taking its median. Client SQL counts are unchanged: 15 for one table, and
+24/15 for ten tables using the table/database interfaces. All runs checked
+merge conflict counts and data after merge, revert, and reset.
+
+To reproduce, run the following against each server build separately, using
+its own exclusive INFO JSON log and a different output filename:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --reps 3 \
+  --modes summary database --server-log /tmp/mo.json.log \
+  --out /tmp/mo-stage-profile.json
+```
+
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
