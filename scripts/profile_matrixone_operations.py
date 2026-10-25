@@ -91,6 +91,59 @@ def summarize_merge_timings(records, expected_requests):
     }
 
 
+def summarize_restore_work(records, expected_requests, operation):
+    """Restore-owned SQL only; catalog SQL and transaction finish are excluded."""
+    work = [r for r in records if r.get("msg") == "DataBranch-Restore-Work"]
+    issues = []
+    if not work:
+        issues.append("no restore work records; server may lack instrumentation or use a legacy path")
+    if len(work) != expected_requests:
+        issues.append(f"expected {expected_requests} restore records, captured {len(work)}")
+    ids = [r.get("request_id") for r in work]
+    if any(not isinstance(i, str) or not i for i in ids) or len(set(map(str, ids))) != len(ids):
+        issues.append("missing or duplicate restore IDs")
+    keys = {"stage_create", "delete", "update", "insert", "stage_drop"}
+
+    def integer(v):
+        return type(v) is int and v >= 0
+
+    def duration(v):
+        return type(v) in (int, float) and math.isfinite(v) and v >= 0
+
+    for record in work:
+        counts, phases = record.get("sql_counts"), record.get("phases_ms")
+        valid = (record.get("schema_version") == 1 and record.get("operation") == operation
+                 and record.get("status") in ("ok", "error", "panic")
+                 and all(integer(record.get(k)) for k in ("table_count", "sql_statements", "empty_stages",
+                                                          "unknown_stages", "materialized_rows"))
+                 and isinstance(counts, dict) and set(counts) == keys
+                 and all(integer(v) for v in counts.values())
+                 and isinstance(phases, dict) and set(phases) == keys | {"other"}
+                 and all(duration(v) for v in phases.values()) and duration(record.get("total_ms")))
+        if not valid:
+            issues.append("invalid or unsupported restore work record")
+            continue
+        if sum(counts.values()) != record["sql_statements"]:
+            issues.append("restore SQL counts do not sum to sql_statements")
+        if record["empty_stages"] + record["unknown_stages"] > counts["stage_create"]:
+            issues.append("restore stage counts exceed materialization attempts")
+        if not math.isclose(sum(phases.values()), record["total_ms"], rel_tol=1e-6, abs_tol=1e-6):
+            issues.append("restore phases do not sum to total_ms")
+    complete = bool(work) and not issues
+    counts, phases = Counter(), Counter()
+    if complete:
+        for record in work:
+            counts.update(record["sql_counts"])
+            phases.update(record["phases_ms"])
+    return {"available": bool(work), "complete": complete, "issues": list(dict.fromkeys(issues)),
+            "scope": "restore stage/apply/cleanup statements; excludes nested CTAS INSERTs, "
+                     "catalog/authorization SQL and transaction finish; status is work status only",
+            "sql_statements": sum(r["sql_statements"] for r in work) if complete else None,
+            "sql_counts": dict(counts) if complete else None,
+            "total_ms": sum(r["total_ms"] for r in work) if complete else None,
+            "phases_ms": dict(phases) if complete else None, "records": work}
+
+
 class SQLTrace:
     """Trace one buffered PyMySQL connection without changing the adapter."""
 
@@ -195,6 +248,11 @@ class SQLTrace:
                 expected = sum(r["error"] is None and r["sql"].lstrip().upper().startswith("DATA BRANCH MERGE ")
                                for r in self.records)
                 measurement["server_merge_timing"] = summarize_merge_timings(records, expected)
+            if operation in ("reset", "revert"):
+                prefix = f"DATA BRANCH {operation.upper()} DATABASE "
+                expected = sum(r["error"] is None and r["sql"].lstrip().upper().startswith(prefix)
+                               for r in self.records)
+                measurement["server_restore_work"] = summarize_restore_work(records, expected, operation)
             if operation in ("diff", "merge") and not events["DataBranch-HashDiff-Done"]:
                 raise RuntimeError("No HashDiff events captured; use an exclusive server with INFO JSON logging")
         return result, measurement

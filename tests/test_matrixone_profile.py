@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from scripts.profile_matrixone_operations import SQLTrace, summarize_merge_timings
+from scripts.profile_matrixone_operations import SQLTrace, summarize_merge_timings, summarize_restore_work
 
 
 @pytest.mark.parametrize("options", [{"history_rows": -1}, {"log_copy": "unknown"}])
@@ -39,6 +39,91 @@ def events(request_id="r", tables=2, status="ok"):
                            "request_id": request_id, "table_count": tables, "status": status,
                            "total_ms": tables * 3 + 4,
                            "phases_ms": {"diff": tables, "apply": tables * 2, "txn_finish": 4}}]
+
+
+def restore_event(operation="reset"):
+    return {"msg": "DataBranch-Restore-Work", "schema_version": 1, "request_id": "r",
+            "operation": operation, "status": "ok", "table_count": 1,
+            "sql_statements": 3, "sql_counts": {"stage_create": 2, "delete": 0, "update": 0,
+                                               "insert": 0, "stage_drop": 1},
+            "empty_stages": 2, "unknown_stages": 0, "materialized_rows": 0, "total_ms": 6,
+            "phases_ms": {"stage_create": 3, "delete": 0, "update": 0, "insert": 0,
+                          "stage_drop": 2, "other": 1}}
+
+
+@pytest.mark.parametrize("operation", ["reset", "revert"])
+@pytest.mark.parametrize("status", ["ok", "error", "panic"])
+def test_restore_work_keeps_status_and_counts_once(operation, status):
+    event = restore_event(operation)
+    event.update(status=status, empty_stages=1, unknown_stages=1)
+    second = dict(event, request_id="r2")
+    result = summarize_restore_work([event, second, *events()], 2, operation)
+    assert result["complete"] and result["issues"] == []
+    assert result["sql_statements"] == 6 and result["total_ms"] == 12
+    assert sum(result["sql_counts"].values()) == 6
+    assert sum(result["phases_ms"].values()) == 12
+    assert result["records"][0]["status"] == status
+
+
+@pytest.mark.parametrize("change", [
+    lambda r: r.append(deepcopy(r[0])),
+    lambda r: r[0].pop("request_id"),
+    lambda r: r[0].update(operation="merge"),
+    lambda r: r[0].update(schema_version=2),
+    lambda r: r[0].update(sql_statements=4),
+    lambda r: r[0].update(table_count=True),
+    lambda r: r[0].update(unknown_stages=1),
+    lambda r: r[0].update(materialized_rows=-1),
+    lambda r: r[0].update(total_ms=float("nan")),
+    lambda r: r[0].update(total_ms=7),
+    lambda r: r[0]["sql_counts"].pop("update"),
+    lambda r: r[0]["phases_ms"].update(txn_finish=0),
+])
+def test_invalid_restore_records_do_not_publish_totals(change):
+    records = [restore_event()]
+    change(records)
+    result = summarize_restore_work(records, 1, "reset")
+    assert result["available"] and not result["complete"] and result["issues"]
+    assert result["sql_statements"] is None and result["total_ms"] is None
+
+
+def test_old_restore_server_does_not_report_zero_work():
+    result = summarize_restore_work([], 1, "reset")
+    assert not result["available"] and not result["complete"]
+    assert result["sql_statements"] is None
+
+
+@pytest.mark.parametrize("operation", ["reset", "revert"])
+def test_trace_attributes_restore_work_to_current_native_request(tmp_path, operation):
+    log = tmp_path / "mo.log"
+    log.write_text(json.dumps(restore_event(operation)) + "\n")
+    trace = SQLTrace(SimpleNamespace(), log)
+
+    def restore():
+        trace.records.append({"sql": f"DATA BRANCH {operation.upper()} DATABASE db FROM snapshot_db",
+                              "error": None, "received_bytes": 11, "returned_rows": 0})
+        with log.open("a") as out:
+            out.write(json.dumps(restore_event(operation)) + "\n")
+
+    _, result = trace.measure(operation, restore)
+    assert result["statements"] == 1
+    assert result["server_restore_work"]["sql_statements"] == 3
+    assert result["server_restore_work"]["complete"]
+    _, result = SQLTrace(SimpleNamespace()).measure(operation, lambda: None)
+    assert "server_restore_work" not in result
+
+
+@pytest.mark.parametrize("options", [{"tables": 0}, {"changed": 50}, {"operation": "merge"}, {"mutation": "wrong"}])
+def test_invalid_restore_profile_does_not_connect(monkeypatch, options):
+    from scripts import profile_matrixone_restore as profile
+
+    connect = Mock()
+    monkeypatch.setattr(profile.mo, "connect", connect)
+    args = dict(tables=1, rows=100, changed=10, operation="reset", mutation="noop", server_log=None)
+    args.update(options)
+    with pytest.raises(ValueError):
+        profile.run_once(**args)
+    connect.assert_not_called()
 
 
 @pytest.mark.parametrize("counts", [[10], [1] * 10])

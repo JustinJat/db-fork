@@ -1748,6 +1748,87 @@ restore. MO commit `31d7c8437` fixes snapshot read-view reuse so a query joining
 two historical versions of the same table reads the correct version on each
 side; the restore commands depend on this fix.
 
+MO commit `2de2c4d43` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+reduces RESET/REVERT work inside the server. CTAS affected-row counts identify
+empty delta stages without additional queries. An empty delete stage skips
+DELETE; an empty row stage skips UPDATE and INSERT. Unknown counts retain the
+original DML. Keyless RESET still deletes current rows even when the historical
+source is empty. All stages are materialized before any destination writes.
+Cleanup drops at most 128 stages per statement; a failed batch preserves the
+error and attempts individual cleanup before transaction rollback.
+
+For tables with a primary key and a writable non-key column, the measured
+restore-owned SQL counts are identical for RESET and REVERT:
+
+| Changes being undone | Before: 1 table | After: 1 table | Before: 10 tables | After: 10 tables |
+| --- | ---: | ---: | ---: | ---: |
+| No changes | 7 | 3 | 70 | 21 |
+| Insert only (restore deletes rows) | 7 | 4 | 70 | 31 |
+| Delete only (restore reinstates rows) | 7 | 5 | 70 | 41 |
+| Update only | 7 | 5 | 70 | 41 |
+| Mixed insert/delete/update | 7 | 6 | 70 | 51 |
+
+These counts cover CTAS, target DML, and stage DROP statements submitted by the
+restore executor. They exclude nested CTAS INSERTs, catalog/authorization SQL,
+and transaction control. Each native restore still takes one client request;
+the adapter's metadata and commit bookkeeping are unchanged. Both CTAS queries
+per primary-key table remain, so this does not remove snapshot joins or stage
+creation costs.
+
+A local comparison on 2026-10-25 used 1,000 rows per table, 100 affected rows
+per mutation kind (300 for the mixed case), and three repetitions for each
+operation/workload/table count. The baseline was `d33aa9d38` with only restore
+work instrumentation/refactoring added, built as `d33aa9d38+restore-counts`;
+its DML and per-stage cleanup were unchanged. The optimized binary identifies
+itself as `2de2c4d43ba8a54d4a5bb83c9d02a11db2009364`. Both used the same
+isolated port 16001, data directory, INFO logging, adapter source, and profiler.
+All 120 native calls passed data, relation-ID, cleanup, and stage-count checks.
+
+| Changes being undone, 10 tables | RESET before/after median (ms) | REVERT before/after median (ms) |
+| --- | ---: | ---: |
+| No changes | 432 / 334 | 343 / 277 |
+| Insert only | 445 / 270 | 452 / 310 |
+| Delete only | 429 / 321 | 568 / 358 |
+| Update only | 522 / 363 | 520 / 412 |
+| Mixed | 491 / 380 | 524 / 500 |
+
+The ten-table medians improved by 1.05–1.65x in this sample. SQL reductions
+were deterministic; latency varied substantially between repetitions. Server
+versions ran in separate blocks, with operation/case order reversed on alternate
+repetitions. One-table insert-only RESET did not improve (47 / 49 ms), and
+ten-table mixed REVERT improved only slightly. These are local single-request
+measurements, not throughput or tail-latency claims.
+
+`scripts.profile_matrixone_restore` measures the single native request on
+fresh scratch data, checking every resulting row, unchanged relation IDs,
+absence of leaked stages, and CTAS row counts. REVERT cases also verify that
+later changes outside the reversed delta survive. Use an exclusive local
+server with INFO JSON logging and no log rotation:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_restore \
+  --tables 1 10 --rows 1000 --changed 100 --reps 3 \
+  --server-log /path/to/mo.json.log --out /tmp/mo-restore.json
+```
+
+The JSON records server `version()`/`git_version()`, adapter commit/dirty
+state, source hashes, raw client queries, and `server_restore_work` counts and
+phase timings. The operation profiler also captures these records for its
+full adapter RESET/REVERT calls. Missing or inconsistent instrumentation is
+marked incomplete rather than reported as zero work. Work timings begin after
+planning and end before transaction finish; `status=ok` describes that work,
+not the eventual transaction commit. Client elapsed time includes the complete
+native request.
+
+Go branch/diff/snapshot regression tests and 154 Python adapter/profile/live
+tests passed. Coverage includes unknown or stale affected-row counts, empty
+keyless sources, key-only and composite primary keys, exact decimal/binary/NULL
+values, explicit rollback, late constraint failures, cleanup errors and panics,
+and cleanup batch boundaries. Final complete adapter workflows at 1 and 10
+tables passed merge/conflict/restore checks and captured complete restore work
+records. Client counts remain 11 for REVERT and 7 for RESET in that workload.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
