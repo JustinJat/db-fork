@@ -154,7 +154,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     prev_db VARCHAR(64),
     ts DATETIME(6),
     schema_json TEXT,
-    PRIMARY KEY (seq)
+    PRIMARY KEY (seq),
+    KEY _bb_commit_id (id)
 )
 """
 
@@ -463,10 +464,30 @@ class MatrixOneToolSuite(DBToolSuite):
 
     def _ensure_meta(self, db: str) -> None:
         self._execute(_COMMITS_DDL.format(table=_qt(db, COMMITS_TABLE)))
+        self._ensure_commit_index(db)
         n = self._execute(f"SELECT COUNT(*) FROM {_qt(db, COMMITS_TABLE)};")[0][0]
         if not n:
             self._add_commit(db, "root", "initial state", None, db, None, None,
                              take_snapshot=True)
+
+    def _ensure_commit_index(self, db: str) -> None:
+        """Upgrade existing logs too; multiple workers may initialize together.
+
+        The index is deliberately non-unique: a merge can record the source
+        commit's id after copying that same commit into the destination log.
+        """
+        def exists():
+            return bool(self._execute(
+                "SELECT 1 FROM information_schema.statistics "
+                "WHERE LOWER(table_schema) = LOWER(%s) AND table_name = %s "
+                "AND index_name = '_bb_commit_id' LIMIT 1", (db, COMMITS_TABLE)))
+
+        if not exists():
+            try:
+                self._execute_ddl(f"CREATE INDEX _bb_commit_id ON {_qt(db, COMMITS_TABLE)} (id)")
+            except pymysql.MySQLError:
+                if not exists():
+                    raise
 
     def _schema_at(self, ref: Ref) -> dict:
         """A commit's schema is the fingerprint recorded with its log row;
@@ -602,6 +623,37 @@ class MatrixOneToolSuite(DBToolSuite):
     # ------------------------------------------------------------------
     # Table metadata
     # ------------------------------------------------------------------
+
+    def _catalog(self, db: str) -> dict:
+        """Read the current database's table/column/PK metadata in one query.
+
+        Callers own this per-operation dictionary. Never retain it across
+        operations: another worker can change the schema or rebase a branch.
+        PK order comes from the index, which need not match column order.
+        Snapshot readability is checked separately by the caller.
+        """
+        rows = self._execute(
+            "SELECT c.table_name, c.column_name, c.column_type, c.is_nullable, "
+            "c.column_default, s.seq_in_index "
+            "FROM information_schema.columns c JOIN information_schema.tables t "
+            "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+            "LEFT JOIN information_schema.statistics s ON s.table_schema = c.table_schema "
+            "AND s.table_name = c.table_name AND s.column_name = c.column_name "
+            "AND s.index_name = 'PRIMARY' "
+            "WHERE LOWER(c.table_schema) = LOWER(%s) AND t.table_type = 'BASE TABLE' "
+            "AND c.table_name NOT LIKE %s ORDER BY c.table_name, c.ordinal_position",
+            (db, META_PREFIX.replace("_", r"\_") + "%")) or []
+        out = {}
+        for table, name, ctype, nullable, default, pk_pos in rows:
+            spec = out.setdefault(table, {"columns": [], "pk": []})
+            if str(name).startswith("__mo_"):
+                continue
+            spec["columns"].append((name, ctype, nullable, default))
+            if pk_pos is not None:
+                spec["pk"].append((int(pk_pos), name))
+        for spec in out.values():
+            spec["pk"] = [name for _, name in sorted(spec["pk"])]
+        return out
 
     def _tables(self, db: str) -> list:
         rows = self._execute(
@@ -887,20 +939,23 @@ class MatrixOneToolSuite(DBToolSuite):
 
     # -- schema reconciliation (merge, rebase) -----------------------------
 
-    def _reconcile_schema(self, ours_db: str, theirs: _State) -> dict:
+    def _reconcile_schema(self, ours_db: str, theirs: _State,
+                          ours_catalog: dict = None, theirs_catalog: dict = None) -> dict:
         """Give ours_db the tables and columns theirs has and it lacks; a
         differing primary key is a schema conflict (raised before any
         change)."""
-        ours = set(self._tables(ours_db))
-        theirs_tables = [t for t in self._tables(theirs.db) if self._readable(theirs, t)]
+        ours_catalog = self._catalog(ours_db) if ours_catalog is None else ours_catalog
+        theirs_catalog = self._catalog(theirs.db) if theirs_catalog is None else theirs_catalog
+        ours = set(ours_catalog)
+        theirs_tables = [t for t in theirs_catalog if self._readable(theirs, t)]
         new_tables = sorted(set(theirs_tables) - ours)
         plan_cols = []
         for table in sorted(ours & set(theirs_tables)):
-            if self._pk(ours_db, table) != self._pk(theirs.db, table):
+            if ours_catalog[table]["pk"] != theirs_catalog[table]["pk"]:
                 raise RuntimeError(f"schema conflict on {table}: primary keys differ "
                                    f"between {ours_db} and {theirs.db}")
-            have = {c[0]: c[1] for c in self._columns(ours_db, table)}
-            for name, ctype, nullable, default in self._columns(theirs.db, table):
+            have = {c[0]: c[1] for c in ours_catalog[table]["columns"]}
+            for name, ctype, nullable, default in theirs_catalog[table]["columns"]:
                 if name not in have:
                     plan_cols.append((table, name, ctype, default))
                 elif str(ctype).lower() != str(have[name]).lower():
@@ -908,11 +963,14 @@ class MatrixOneToolSuite(DBToolSuite):
                                        f"(ours {have[name]}, theirs {ctype})")
         for table in new_tables:
             self._execute(f"DATA BRANCH CREATE TABLE {_qt(ours_db, table)} FROM {theirs.expr(table)};")
+            # A snapshot clone can have an older schema than the source's
+            # current catalog. New tables are excluded from the merge loop.
         for table, name, ctype, default in plan_cols:
             ddl = f"ALTER TABLE {_qt(ours_db, table)} ADD COLUMN {_quote(name)} {ctype} NULL"
             if default is not None and str(default).lower() != "null":
                 ddl += f" DEFAULT {default}"
             self._execute(ddl)
+            ours_catalog[table]["columns"].append((name, ctype, "YES", default))
         return {"added_tables": new_tables,
                 "added_columns": [f"{t}.{c}" for t, c, _, _ in plan_cols]}
 
@@ -1040,6 +1098,8 @@ class MatrixOneToolSuite(DBToolSuite):
                        f"{theirs.db} and {ours_db} share no fork point: merging two-way")
         want_rows = callable(on_conflict)
         policy = "SKIP" if (want_rows or on_conflict == "ours") else "ACCEPT"
+        ours_catalog = self._catalog(ours_db)
+        theirs_catalog = self._catalog(theirs.db)
         if MO_NATIVE_MERGE_AS_IS:
             # Native-only mode: the engine's merge as it is. A column the
             # target lacks is left out of the result, a table only the
@@ -1047,11 +1107,11 @@ class MatrixOneToolSuite(DBToolSuite):
             # engine refuse (a failed merge, caught by the checks).
             schema = {"added_tables": [], "added_columns": []}
         else:
-            schema = self._reconcile_schema(ours_db, theirs)
+            schema = self._reconcile_schema(ours_db, theirs, ours_catalog, theirs_catalog)
         conflicts = []
         self._fk_checks(False)
         try:
-            for table in sorted(set(self._tables(ours_db)) & set(self._tables(theirs.db))):
+            for table in sorted(ours_catalog.keys() & theirs_catalog.keys()):
                 if table in schema["added_tables"] or not self._readable(theirs, table):
                     continue
                 (ti, td, tu), (oi, od, ou) = self._summary(theirs.expr(table), _qt(ours_db, table))
@@ -1060,11 +1120,12 @@ class MatrixOneToolSuite(DBToolSuite):
                 if not (ti + td + tu):
                     continue
                 n_conf, rows = 0, []
-                pk = self._pk(ours_db, table)
+                pk = ours_catalog[table]["pk"]
                 if rel is not None and (oi + od + ou) and pk and (want_rows or MO_COUNT_CONFLICTS):
                     child, parent, row = rel
                     base = _State(row["prev_db"], row["prev_snap"])
-                    cols = self._common_cols(ours_db, theirs.db, table)
+                    theirs_cols = {c[0] for c in theirs_catalog[table]["columns"]}
+                    cols = [c[0] for c in ours_catalog[table]["columns"] if c[0] in theirs_cols]
                     if self._readable(base, table):
                         d_t = self._delta(theirs.expr(table), base.expr(table), pk)
                         d_o = self._delta(_qt(ours_db, table), base.expr(table), pk)

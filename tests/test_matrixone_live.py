@@ -46,6 +46,21 @@ def rows(suite, ref, sql):
     return [tuple(r) for r in suite.exec([sql], refs=[ref])[0].rows]
 
 
+def test_bulk_catalog_matches_table_metadata_and_indexes_existing_logs(suite):
+    suite.exec(["CREATE TABLE composite_pk (a INT, b INT, v VARCHAR(8) DEFAULT 'x', "
+                "PRIMARY KEY (b, a))"], refs=["main"], raise_on_error=True)
+    catalog = suite._catalog(DB)
+    assert sorted(catalog) == sorted(suite._tables(DB))
+    for table, spec in catalog.items():
+        assert spec["columns"] == suite._columns(DB, table)
+        assert spec["pk"] == suite._pk(DB, table)
+    assert catalog["composite_pk"]["pk"] == ["b", "a"]
+    suite._execute(f"DROP INDEX _bb_commit_id ON `{DB}`.`_bb_commits`")
+    suite._ensure_commit_index(DB)
+    indexes = suite._execute(f"SHOW INDEX FROM `{DB}`.`_bb_commits`")
+    assert any(r[2] == "_bb_commit_id" and r[1] == 1 for r in indexes)
+
+
 @needs_simulated
 def test_implementation_summary():
     impl = matrixone.MatrixOneToolSuite.implementation()
