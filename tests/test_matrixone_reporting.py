@@ -7,7 +7,7 @@ import pymysql
 import pytest
 
 from dblib import matrixone as mo
-from dblib.db_api import DBToolSuite
+from dblib.db_api import DBToolSuite, Ref
 from dblib.result_collector import ResultCollector
 
 
@@ -18,6 +18,7 @@ def suite(monkeypatch, tmp_path):
     s = object.__new__(mo.MatrixOneToolSuite)
     DBToolSuite.__init__(s, Mock(), ResultCollector(output_dir=str(tmp_path)))
     s._warned = set()
+    s._database_branch_supported = {"diff": None, "merge": None}
     s._merge_summary_supported = None
     s._on = Mock(return_value="ours")
     s._state = Mock(return_value=mo._State("theirs"))
@@ -36,6 +37,10 @@ def suite(monkeypatch, tmp_path):
 
 def server(mode):
     def execute(sql, args=None):
+        if sql.startswith("DATA BRANCH MERGE DATABASE"):
+            if mode == "database":
+                return [(t, 1, 1, 0, 0, 1, 0, 0, 0, 0) for t in ("a", "b")]
+            raise pymysql.ProgrammingError(1064, 'syntax error at line 1 near "DATABASE"')
         if sql.startswith("DATA BRANCH MERGE") and sql.endswith("OUTPUT SUMMARY"):
             if mode == "table":
                 return [(0, 0, 1, 0, 0, 0, 0)]
@@ -44,6 +49,7 @@ def server(mode):
 
 
 @pytest.mark.parametrize("mode,path,summary", [
+    ("database", "database_merge_summary", "native"),
     ("table", "table_merge_summary", "native"),
     ("legacy", "legacy_table_merge", "legacy"),
 ])
@@ -54,10 +60,10 @@ def test_merge_result_and_recorded_path_follow_negotiation(suite, mode, path, su
         assert result.ok, result.error
         assert result.value["merge_summary"] == summary
         assert result.execution_paths == [path]
-        assert len(result.fallback_reasons) == {"table": 0, "legacy": 1}[mode]
+        assert len(result.fallback_reasons) == {"database": 0, "table": 1, "legacy": 2}[mode]
         assert all("server rejected syntax" in reason for reason in result.fallback_reasons)
     output = capsys.readouterr().out
-    assert output.count("Warning:") == {"table": 0, "legacy": 1}[mode]
+    assert output.count("Warning:") == {"database": 0, "table": 1, "legacy": 2}[mode]
     assert suite.result_collector.support_summary()["execution_path_counts"]["MERGE"][path]["ok"] == 2
 
 
@@ -73,16 +79,16 @@ def test_failed_native_path_is_recorded_without_fallback(suite, error, capsys):
     suite._execute = Mock(side_effect=execute)
     result = suite.merge("main", "feature")
     assert result.failed
-    assert result.execution_paths == ["table_merge_summary"]
+    assert result.execution_paths == ["database_merge_summary"]
     assert result.fallback_reasons == []
     suite._summary.assert_not_called()
     assert "Warning:" not in capsys.readouterr().out
     counts = suite.result_collector.support_summary()["execution_path_counts"]
-    assert counts["MERGE"]["table_merge_summary"]["failed"] == 1
+    assert counts["MERGE"]["database_merge_summary"]["failed"] == 1
 
 
 def test_custom_resolver_is_reported_as_legacy_without_native_probe(suite):
-    suite._execute = server("table")
+    suite._execute = server("database")
     result = suite.merge("main", "feature", on_conflict=lambda db, conflicts: None)
     assert result.ok
     assert result.value["merge_summary"] == "legacy"
@@ -93,7 +99,7 @@ def test_custom_resolver_is_reported_as_legacy_without_native_probe(suite):
 
 def test_invoked_custom_resolver_is_recorded(suite, monkeypatch):
     monkeypatch.setattr(mo, "MO_COUNT_CONFLICTS", True)
-    suite._execute = server("table")
+    suite._execute = server("database")
     suite._summary.return_value = ((0, 0, 1), (0, 0, 1))
     suite._delta = Mock(return_value={})
     suite._conflict_keys = Mock(return_value=[(1,)])
@@ -117,12 +123,13 @@ def test_read_only_schema_rejection_records_sql_diff(suite, monkeypatch):
     result = suite.diff("main", "feature")
     assert result.ok, result.error
     assert result.execution_paths == ["sql_diff"]
-    assert result.fallback_reasons == ["table_diff_summary: incompatible schema"]
+    assert result.fallback_reasons == ["database_diff_summary: incompatible schema",
+                                       "table_diff_summary: incompatible schema"]
 
 
 def test_snapshot_readability_is_checked_once_per_source_table(suite):
     suite._state.return_value = mo._State("theirs", "past")
-    suite._execute = server("table")
+    suite._execute = server("database")
     assert suite.merge("main", "feature@commit").ok
     assert suite._readable.call_count == 2
     assert {c.args[1] for c in suite._readable.call_args_list} == {"a", "b"}
@@ -130,7 +137,7 @@ def test_snapshot_readability_is_checked_once_per_source_table(suite):
 
 def test_empty_merge_does_not_claim_a_native_request(suite):
     suite._catalog.return_value = {}
-    suite._execute = server("table")
+    suite._execute = server("database")
     result = suite.merge("main", "feature")
     assert result.ok
     assert result.value["merge_summary"] == "none"

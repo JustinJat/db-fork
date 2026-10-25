@@ -129,6 +129,11 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
         backend.setup_database(db)
         suite = backend.MatrixOneToolSuite.init_for_bench(rc.ResultCollector(), db)
         suite._merge_summary_supported = False if mode == "legacy" else None
+        if hasattr(suite, "_database_branch_supported"):
+            suite._database_branch_supported = {
+                "diff": None if mode == "database" else False,
+                "merge": None if mode == "database" else False,
+            }
         with suite.conn.cursor() as cur:
             for i in range(table_count):
                 cur.execute(f"CREATE TABLE t{i}(id INT PRIMARY KEY, v INT)")
@@ -162,6 +167,8 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
             merged = measure("merge", lambda: suite.merge("main", "feature", on_conflict="ours"))
             if mode == "summary" and suite._merge_summary_supported is not True:
                 raise RuntimeError("Server does not support MERGE OUTPUT SUMMARY")
+            if mode == "database" and suite._database_branch_supported["merge"] is not True:
+                raise RuntimeError("Server does not support database MERGE OUTPUT SUMMARY")
             expected_conflicts = table_count * (changed // 2)
             if merged["conflicts"] != expected_conflicts:
                 raise AssertionError((merged["conflicts"], expected_conflicts))
@@ -191,7 +198,8 @@ def main():
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--changed", type=int, default=100)
     parser.add_argument("--reps", type=int, default=3)
-    parser.add_argument("--modes", nargs="+", choices=["legacy", "summary"], default=["legacy", "summary"])
+    parser.add_argument("--modes", nargs="+", choices=["legacy", "summary", "database"],
+                        default=["legacy", "summary", "database"])
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--server-log", type=Path, help="local INFO JSON log of an exclusive test server")
     args = parser.parse_args()

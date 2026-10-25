@@ -32,9 +32,9 @@ report uses):
                DATA BRANCH CREATE DATABASE <branch> FROM <parent> {snapshot}
     commit     CREATE SNAPSHOT FOR DATABASE <branch> + a _bb_commits row
     log        SELECT FROM _bb_commits
-    diff       DATA BRANCH DIFF ... OUTPUT SUMMARY per table
-    merge      DATA BRANCH MERGE <src>.<t> INTO <dst>.<t> WHEN CONFLICT
-               SKIP|ACCEPT OUTPUT SUMMARY per table ("ours" | "theirs");
+    diff       DATA BRANCH DIFF DATABASE ... OUTPUT SUMMARY (table fallback)
+    merge      DATA BRANCH MERGE DATABASE <src> INTO <dst> TABLES (...)
+               WHEN CONFLICT SKIP|ACCEPT OUTPUT SUMMARY ("ours" | "theirs");
                older servers and custom resolvers use a pre-merge summary
                and two native diffs against the fork snapshot, with
                conflict rows joined in Python
@@ -118,6 +118,7 @@ MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("
 # Set to 0 for a controlled comparison with the legacy multi-statement path.
 # Unsupported servers are detected once per connection by a parser error.
 MO_MERGE_SUMMARY = os.environ.get("MO_MERGE_SUMMARY", "1").lower() not in ("0", "false", "no")
+MO_DATABASE_BRANCH = os.environ.get("MO_DATABASE_BRANCH", "1").lower() not in ("0", "false", "no")
 
 # Native-only mode (DBFORK_NATIVE_ONLY=1) resets with the engine's own
 # RESTORE DATABASE as it is (it gives the restored tables new identities
@@ -365,16 +366,17 @@ class MatrixOneToolSuite(DBToolSuite):
     IMPLEMENTATION_NOTES = {
         "branch": "CREATE SNAPSHOT on the parent + DATA BRANCH CREATE DATABASE FROM {snapshot}",
         "commit": "CREATE SNAPSHOT FOR DATABASE; message/order in a _bb_commits row",
-        "diff": "DATA BRANCH DIFF ... OUTPUT SUMMARY per table (native LCA)",
+        "diff": "DATA BRANCH DIFF DATABASE ... OUTPUT SUMMARY (native LCA; table fallback)",
         "log": "SELECT from the _bb_commits bookkeeping table",
-        "merge": "DATA BRANCH MERGE ... WHEN CONFLICT SKIP|ACCEPT OUTPUT SUMMARY per table "
+        "merge": "DATA BRANCH MERGE DATABASE ... WHEN CONFLICT SKIP|ACCEPT OUTPUT SUMMARY "
                  "returns pre-merge logical change/conflict counts in the same request; the optimized "
                  "server collects them in one diff traversal per table. Older servers fall back to "
-                 "legacy separate DIFF summaries and two diffs against the fork snapshot for "
-                 "conflict counts. Custom resolvers use the legacy row path and write over the "
-                 "SKIP result. Added tables/columns are reconciled first except in native-only "
-                 "mode. Data apply has per-table atomicity; schema and commit-log updates are "
-                 "separate. Actual paths and fallback reasons are recorded per operation",
+                 "table-level MERGE ... OUTPUT SUMMARY, then legacy separate DIFF summaries and "
+                 "two diffs against the fork snapshot for conflict counts. Custom resolvers use "
+                 "the legacy row path and write over the SKIP result. Added tables/columns are "
+                 "reconciled first except in native-only mode. Database data apply is atomic; "
+                 "schema and commit-log updates are separate. Actual paths and fallback reasons "
+                 "are recorded per operation",
         "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
                    "snapshot and snapshotted (the new base); the branch's delta since its previous "
                    "base (a native diff of its own two snapshots) is copied in with SQL from "
@@ -418,6 +420,10 @@ class MatrixOneToolSuite(DBToolSuite):
         self._temp_dbs: dict = {}
         self._warned = set()
         self._merge_summary_supported = None if MO_MERGE_SUMMARY else False
+        self._database_branch_supported = {
+            "diff": None if MO_DATABASE_BRANCH else False,
+            "merge": None if MO_DATABASE_BRANCH and MO_MERGE_SUMMARY else False,
+        }
         self._meta_db = meta_db_name(db_name)
         self._ensure_registry()
         self._ensure_meta(self._db_for(default_branch_name))
@@ -914,6 +920,29 @@ class MatrixOneToolSuite(DBToolSuite):
 
     def _diff_impl(self, ref_a: Ref, ref_b: Ref) -> dict:
         a, b = self._state(ref_a), self._state(ref_b)
+        try:
+            summary = self._database_summary("diff", b, a)
+        except pymysql.MySQLError as exc:
+            # DIFF is read-only: retain the existing schema-compatibility
+            # fallback when historical column identities cannot be compared.
+            if "schema compatibility check" not in str(exc) or MO_NATIVE_DIFF_ONLY:
+                raise
+            self._record_execution(fallback_reason="database_diff_summary: incompatible schema")
+            summary = None
+        if summary is not None:
+            out = []
+            for table, (exists_b, exists_a, counts) in sorted(summary.items()):
+                if table.startswith(META_PREFIX):
+                    continue
+                bi, bd, bu, ai, ad, au, _ = counts
+                item = {"table_name": table, "rows_added": bi + ad,
+                        "rows_deleted": bd + ai, "rows_modified": bu + au}
+                if exists_a and exists_b:
+                    item.update(b_side=[bi, bd, bu], a_side=[ai, ad, au])
+                out.append(item)
+            return {"tables": out,
+                    **{key: sum(t[key] for t in out)
+                       for key in ("rows_added", "rows_deleted", "rows_modified")}}
         tables_a = {t for t in self._tables(a.db) if self._readable(a, t)}
         tables_b = {t for t in self._tables(b.db) if self._readable(b, t)}
         if not (tables_a or tables_b):
@@ -1158,6 +1187,70 @@ class MatrixOneToolSuite(DBToolSuite):
                        "for this connection (see execution_paths and fallback_reasons)")
         self._record_execution(fallback_reason=reasons.get(path, f"{path}: disabled"))
 
+    @staticmethod
+    def _database_expr(state: _State) -> str:
+        expr = _quote(state.db)
+        if state.snap:
+            expr += "{snapshot=" + pymysql.converters.escape_str(state.snap) + "}"
+        return expr
+
+    def _database_summary(self, operation: str, source: _State, destination: _State,
+                          tables=None, policy=None):
+        """Return all table summaries in one request; never replay a failed write."""
+        supported = self._database_branch_supported
+        path = f"database_{operation}_summary"
+        if supported[operation] is False:
+            self._native_path_unavailable(path)
+            return None
+        if tables is not None and not tables:
+            self._record_execution("no_data_tables")
+            return {}
+        join = "AGAINST" if operation == "diff" else "INTO"
+        sql = (f"DATA BRANCH {operation.upper()} DATABASE {self._database_expr(source)} "
+               f"{join} {self._database_expr(destination)}")
+        if tables is None:
+            sql += f" IGNORE TABLES ({_quote(COMMITS_TABLE)})"
+        else:
+            sql += " TABLES (" + ", ".join(map(_quote, tables)) + ")"
+        if policy is not None:
+            sql += " WHEN CONFLICT " + policy
+        try:
+            rows = self._execute(sql + " OUTPUT SUMMARY")
+        except Exception as exc:
+            if (isinstance(exc, pymysql.MySQLError) and supported[operation] is None
+                    and exc.args and exc.args[0] == 1064
+                    and re.search(r'syntax error at .*near [\'\"]\s*database\b', str(exc), re.I)):
+                supported[operation] = False
+                self._native_path_unavailable(path, parser_rejected=True)
+                return None
+            # Read-only schema rejection is handled by _diff_impl's SQL
+            # fallback; do not count that rejected probe as a native result.
+            if operation != "diff" or MO_NATIVE_DIFF_ONLY or "schema compatibility check" not in str(exc):
+                self._record_execution(path)
+            raise
+        self._record_execution(path)
+        result = {}
+        try:
+            if rows is None:
+                raise ValueError("missing result")
+            for row in rows:
+                if len(row) != 10:
+                    raise ValueError("wrong column count")
+                name, src, dst, *counts = row
+                counts = tuple(int(n) for n in counts)
+                if (not isinstance(name, str) or name in result or src not in (0, 1)
+                        or dst not in (0, 1) or not (src or dst) or any(n < 0 for n in counts)):
+                    raise ValueError("invalid table summary")
+                if operation == "merge" and not (src and dst):
+                    raise ValueError("missing merge endpoint")
+                result[name] = (bool(src), bool(dst), counts)
+            if tables is not None and set(result) != set(tables):
+                raise ValueError("incomplete table results")
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("Invalid MatrixOne database summary; operation was not retried") from exc
+        supported[operation] = True
+        return result
+
     def _merge_with_summary(self, source: str, target: str, policy: str):
         """Merge and return native pre-merge counts, or None if unsupported.
 
@@ -1190,7 +1283,7 @@ class MatrixOneToolSuite(DBToolSuite):
         return counts[:3], counts[3:6], counts[6]
 
     def _merge_impl(self, into: Ref, source: Ref, message: str, on_conflict="ours") -> dict:
-        """DATA BRANCH MERGE per table. One side is always a clone of the
+        """Database MERGE with a table-level fallback. One side is a clone of the
         other here (the LCA MatrixOne finds is the base recorded in the
         clone's fork/rebase row), so its three-way result matches ours;
         counts come from MERGE OUTPUT SUMMARY where supported. A callable
@@ -1230,11 +1323,17 @@ class MatrixOneToolSuite(DBToolSuite):
                 self._record_execution("no_data_tables")
             if want_rows and tables:
                 self._record_execution(fallback_reason="merge: custom resolver requires conflict rows")
+            database_summary = None if want_rows else self._database_summary(
+                "merge", theirs, _State(ours_db), tables=tables, policy=policy)
             for table in tables:
                 # Native summaries keep conflict rows on the server. A
                 # custom resolver still needs the legacy row-level path.
-                summary = None if want_rows else self._merge_with_summary(
-                    theirs.expr(table), _qt(ours_db, table), policy)
+                if database_summary is not None:
+                    counts = database_summary[table][2]
+                    summary = counts[:3], counts[3:6], counts[6]
+                else:
+                    summary = None if want_rows else self._merge_with_summary(
+                        theirs.expr(table), _qt(ours_db, table), policy)
                 if summary is not None:
                     summary_modes.add("native")
                     source_counts, target_counts, n_conf = summary

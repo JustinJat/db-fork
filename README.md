@@ -751,9 +751,9 @@ Runs against MatrixOne (MySQL-compatible, port 6001). Build it from source
 server's data directory, `MO_DATA_DIR` (default `~/mo/matrixone/mo-data`),
 which covers the whole server.
 
-The native-summary commands measured below are extensions
+The native-summary and database-level commands measured below are extensions
 on [zuyu/matrixone, branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt),
-including commits `8fae23f97` and `c870e3748`.
+including commits `8fae23f97`, `c870e3748`, and `314f7fb5a`.
 Build that branch (or the stated commit) to reproduce those measurements;
 a stock MatrixOne build can select the legacy interface. Check the profiler's
 server identity and observed paths before comparing results.
@@ -778,10 +778,12 @@ same summary for the report):
   is snapshotted too so its own delta can be read later.
 - `commit()` (composed): `CREATE SNAPSHOT FOR DATABASE` plus the log row.
   `log()` (simulated) reads the table.
-- `diff()` (native): `DATA BRANCH DIFF ... OUTPUT SUMMARY` per table.
-- `merge()` (composed): `DATA BRANCH MERGE <src>.<t> INTO <dst>.<t> WHEN
-  CONFLICT SKIP|ACCEPT OUTPUT SUMMARY` per table ("ours" | "theirs") on
-  servers supporting this extension. The single result row contains
+- `diff()` (native): `DATA BRANCH DIFF DATABASE ... OUTPUT SUMMARY`, with
+  one result row per table. Older servers use table-level summaries.
+- `merge()` (composed): `DATA BRANCH MERGE DATABASE <src> INTO <dst>
+  TABLES (...) WHEN CONFLICT SKIP|ACCEPT OUTPUT SUMMARY` ("ours" | "theirs")
+  on servers supporting this extension. Older servers use the table-level
+  `MERGE ... OUTPUT SUMMARY` interface. Each table's result contains
   `source_inserted`, `source_deleted`, `source_updated`,
   `destination_inserted`, `destination_deleted`, `destination_updated`,
   and `conflicts`. These are logical differences **before** the merge,
@@ -798,17 +800,23 @@ same summary for the report):
   selects the legacy path for comparison. Automatic fallback occurs once
   per connection, only after a parser rejection at `OUTPUT`; execution and
   transport errors are never retried as a legacy merge.
-  Parser-triggered fallback warns once per connection.
-  The merge result includes `merge_summary`: `native` (table summaries),
-  `legacy`, `mixed`, or `none` (no eligible data tables).
+  Parser-triggered fallback warns once per rejected interface and connection.
+  The merge result includes `merge_summary`: `native` (database or table
+  summaries), `legacy`, `mixed`, or `none` (no eligible data tables).
+  `MO_DATABASE_BRANCH=0` disables database-level DIFF/MERGE for comparisons.
+  A parser rejection at `DATABASE` selects the older interface once per
+  operation and connection. Database summaries include table names and
+  endpoint-existence flags, and DIFF enumerates tables at the requested
+  snapshot, including tables dropped since then.
   The optimized server collects statistics before update expansion and
   conflict filtering in the same `HashDiff` execution used for apply.
   It reuses retained destination batches to exclude equal changes and
   releases matched primary keys as both sides arrive. Worst-case summary
   memory remains proportional to changed keys. Apply stages are created
   only when a nonempty batch needs applying, so a no-op does not create
-  temporary tables. Database-wide atomic merge is not provided by this
-  per-table interface.
+  temporary tables. The database-level MERGE uses one transaction across
+  the selected data tables; schema reconciliation and adapter commit-log
+  updates are separate. The table-level fallback has per-table atomicity.
   Conflict counts have one known comparison caveat: when a primary-key table
   was created independently on both related branches after their fork,
   native summaries count differing rows with the same key as conflicts.
@@ -855,7 +863,7 @@ change the counts.
 
 Operation results and Parquet rows include `execution_paths` and
 `fallback_reasons` for MatrixOne diff/merge/reset/revert. Merge paths are
-`table_merge_summary` and `legacy_table_merge`;
+`database_merge_summary`, `table_merge_summary`, and `legacy_table_merge`;
 `custom_resolver` records an invoked resolver. An empty table selection is
 `no_data_tables`. Paths are unique per operation, not per-table counters.
 Failed operations retain the path that errored; syntax-rejected probes are
@@ -941,6 +949,21 @@ kept the row count and sum unchanged; their median changed from 175 ms to
 186 ms, so this run shows no no-op latency improvement. Both versions already
 need only one diff pass for a no-op. These small samples do not establish
 throughput or tail latency.
+
+MO commit `314f7fb5a` adds database-level DIFF/MERGE. With the same profiler
+workload (`--modes summary database`, one verification run per mode), client
+statement counts changed as follows:
+
+| Operation | Table interface: 1 table | Database interface: 1 table | Table interface: 10 tables | Database interface: 10 tables |
+| --- | ---: | ---: | ---: | ---: |
+| diff | 13 | 9 | 40 | 9 |
+| merge | 15 | 15 | 24 | 15 |
+
+These counts include adapter metadata and commit bookkeeping. The native
+data operation itself takes one request regardless of table count. Server
+merge work remains one HashDiff per table. MERGE checks permissions for all
+selected tables before applying data and rolls back the entire data statement
+if a later table fails. Schema changes are still reconciled by the adapter.
 
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against

@@ -12,6 +12,7 @@ from dblib.db_api import Ref
 def suite():
     s = object.__new__(mo.MatrixOneToolSuite)
     s._merge_summary_supported = False
+    s._database_branch_supported = {"diff": False, "merge": False}
     return s
 
 
@@ -54,12 +55,15 @@ def test_schema_conflict_is_detected_before_any_ddl():
 
 
 @pytest.mark.parametrize("table_count", [1, 12])
-@pytest.mark.parametrize("native_summary", [False, True])
-def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypatch, table_count, native_summary):
+@pytest.mark.parametrize("mode", ["legacy", "table", "database"])
+def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypatch, table_count, mode):
     monkeypatch.setattr(mo, "MO_NATIVE_MERGE_AS_IS", False)
     monkeypatch.setattr(mo, "MO_COUNT_CONFLICTS", True)
     s = suite()
+    native_summary = mode != "legacy"
     s._merge_summary_supported = native_summary
+    if mode == "database":
+        s._database_branch_supported["merge"] = None
     queries = []
     version = [0]
 
@@ -74,6 +78,8 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
             return [(f"t{i}", *col) for i in range(table_count) for col in cols]
         if sql.startswith("SHOW CREATE TABLE"):
             return [("t", "CREATE TABLE `t` (`id` int, `v` int, `extra` int DEFAULT 7)")]
+        if sql.startswith("DATA BRANCH MERGE DATABASE"):
+            return [(f"t{i}", 1, 1, 1, 0, 0, 1, 0, 0, 1) for i in range(table_count)]
         if sql.endswith("OUTPUT SUMMARY"):
             return [(1, 0, 0, 1, 0, 0, 1)]
         if sql.startswith(("SHOW", "SELECT")):
@@ -100,7 +106,8 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
     catalog_queries = [sql for sql, _ in queries if "information_schema.columns c" in sql]
     assert len(catalog_queries) == 4  # exactly two per operation, at either scale
     assert sum(sql.startswith("ALTER TABLE") for sql, _ in queries) == table_count
-    assert sum(sql.startswith("DATA BRANCH MERGE") for sql, _ in queries) == 2 * table_count
+    assert sum(sql.startswith("DATA BRANCH MERGE") for sql, _ in queries) == (
+        2 if mode == "database" else 2 * table_count)
     if native_summary:
         s._summary.assert_not_called()
         s._readable.assert_not_called()

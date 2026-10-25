@@ -115,7 +115,7 @@ def test_point_json_retains_observed_paths(seeded, monkeypatch):
 def test_report_uses_current_matrixone_merge_notes():
     from macrobench.runner import _implementation_for
     notes = _implementation_for(tp.Backend.MATRIXONE)["notes"]["merge"]
-    assert "MERGE" in notes and "OUTPUT SUMMARY per table" in notes
+    assert "MERGE DATABASE" in notes and "OUTPUT SUMMARY" in notes
     assert "one diff traversal per table" in notes
     assert "legacy separate DIFF" in notes
 
