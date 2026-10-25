@@ -751,6 +751,13 @@ Runs against MatrixOne (MySQL-compatible, port 6001). Build it from source
 server's data directory, `MO_DATA_DIR` (default `~/mo/matrixone/mo-data`),
 which covers the whole server.
 
+The native-summary commands measured below are extensions
+on [zuyu/matrixone, branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt),
+including commits `8fae23f97` and `c870e3748`.
+Build that branch (or the stated commit) to reproduce those measurements;
+a stock MatrixOne build can select the legacy interface. Check the profiler's
+server identity and observed paths before comparing results.
+
 MatrixOne ships "git for data" primitives: database and table branches with
 recorded lineage (`DATA BRANCH CREATE DATABASE ... FROM ... {snapshot}`), a
 three-way `DATA BRANCH DIFF` / `DATA BRANCH MERGE` that finds the lowest
@@ -791,6 +798,9 @@ same summary for the report):
   selects the legacy path for comparison. Automatic fallback occurs once
   per connection, only after a parser rejection at `OUTPUT`; execution and
   transport errors are never retried as a legacy merge.
+  Parser-triggered fallback warns once per connection.
+  The merge result includes `merge_summary`: `native` (table summaries),
+  `legacy`, `mixed`, or `none` (no eligible data tables).
   The optimized server collects statistics before update expansion and
   conflict filtering in the same `HashDiff` execution used for apply.
   It reuses retained destination batches to exclude equal changes and
@@ -799,6 +809,12 @@ same summary for the report):
   only when a nonempty batch needs applying, so a no-op does not create
   temporary tables. Database-wide atomic merge is not provided by this
   per-table interface.
+  Conflict counts have one known comparison caveat: when a primary-key table
+  was created independently on both related branches after their fork,
+  native summaries count differing rows with the same key as conflicts.
+  The legacy path reports zero because that table is absent from the fork
+  snapshot. Thus `MO_MERGE_SUMMARY=0` is not a count-equivalent control for
+  this case. Both paths skip conflict counting for keyless tables.
 - `rebase()` (composed): a re-fork. A temporary clone of the upstream's
   head snapshot receives the branch's delta since its fork point through
   `DATA BRANCH PICK ... BETWEEN SNAPSHOT` (the branch's own snapshots;
@@ -836,6 +852,35 @@ one source row, then merges with `ours`, reverts, and resets. Row counts and
 sums are checked after merge and reset. There are no schema migrations.
 Historical refs, chunked row replay, and different connection state can
 change the counts.
+
+Operation results and Parquet rows include `execution_paths` and
+`fallback_reasons` for MatrixOne diff/merge/reset/revert. Merge paths are
+`table_merge_summary` and `legacy_table_merge`;
+`custom_resolver` records an invoked resolver. An empty table selection is
+`no_data_tables`. Paths are unique per operation, not per-table counters.
+Failed operations retain the path that errored; syntax-rejected probes are
+listed only as fallback reasons. An empty list means no instrumented path
+was reached, not that the native path ran. Cached parser rejections retain
+their reason on subsequent operations; explicitly disabled paths are labeled
+`disabled`.
+
+Run JSON includes `execution_path_counts` by operation/path/status and
+`fallback_reason_counts`; microbench verb repetitions also include the raw
+lists and `merge_summary` when returned. These counts cover recorded operations,
+excluding untimed setup and warm-up. The profiler records the same lists, `merge_summary`, `SELECT
+version(), git_version()` as `server`, the adapter commit, and whether tracked
+adapter files were dirty. Server identity queries are outside measurements.
+The recorded versions are the server's own values; a binary built without
+revision metadata may return `unknown`, which is preserved as such.
+Static `implementation.notes` describe available strategies, not the path a
+particular server executed.
+
+The `_bb_commit_id` index was added to speed commit-id lookups, but its net
+effect has **not** been isolated in these measurements. The extra hidden
+index table cloned with each branch and index maintenance on commit inserts
+are costs included in the totals. These results do not establish an index
+benefit; that needs a separate indexed/unindexed comparison across log sizes,
+including lookup, branch creation, commit latency, and storage.
 
 Measured on 2026-10-25 against local MO commit `8fae23f97`, comparing original
 adapter `1ca34a3` with optimized adapter `c037fed` using native summaries:

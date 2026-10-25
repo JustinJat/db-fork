@@ -98,6 +98,28 @@ def test_supported_verbs_measure_every_timed_rep(seeded):
             assert out["deferred"] == {}
 
 
+def test_point_json_retains_observed_paths(seeded, monkeypatch):
+    original = seeded._commit_impl
+
+    def commit(*args, **kwargs):
+        seeded._record_execution("test_commit", fallback_reason="test: fallback")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(seeded, "_commit_impl", commit)
+    out = _run(seeded, VERB_IMPL["commit"], dict(grid.BASE, rows=5), idx=44)
+    assert out["status"] == "ok"
+    assert all(r["execution_paths"] == ["test_commit"] for r in out["reps"])
+    assert all(r["fallback_reasons"] == ["test: fallback"] for r in out["reps"])
+
+
+def test_report_uses_current_matrixone_merge_notes():
+    from macrobench.runner import _implementation_for
+    notes = _implementation_for(tp.Backend.MATRIXONE)["notes"]["merge"]
+    assert "MERGE" in notes and "OUTPUT SUMMARY per table" in notes
+    assert "one diff traversal per table" in notes
+    assert "legacy separate DIFF" in notes
+
+
 def test_branch_from_an_older_commit_and_with_live_branches(seeded):
     out = _run(seeded, VERB_IMPL["branch"], dict(grid.BASE, age=2, live=3), idx=10)
     assert out["status"] == "ok" and out["failed"] == 0

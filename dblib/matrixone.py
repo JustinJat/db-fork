@@ -367,11 +367,14 @@ class MatrixOneToolSuite(DBToolSuite):
         "commit": "CREATE SNAPSHOT FOR DATABASE; message/order in a _bb_commits row",
         "diff": "DATA BRANCH DIFF ... OUTPUT SUMMARY per table (native LCA)",
         "log": "SELECT from the _bb_commits bookkeeping table",
-        "merge": "DATA BRANCH MERGE per table WHEN CONFLICT SKIP|ACCEPT; conflict rows/count "
-                 "from two native diffs against the fork snapshot; a resolve callable writes over "
-                 "the SKIP result. Tables and columns the source adds are created on the target "
-                 "first (the engine merges shared columns only and refuses a retyped one); in "
-                 "native-only mode that step is skipped and the engine's merge runs as it is",
+        "merge": "DATA BRANCH MERGE ... WHEN CONFLICT SKIP|ACCEPT OUTPUT SUMMARY per table "
+                 "returns pre-merge logical change/conflict counts in the same request; the optimized "
+                 "server collects them in one diff traversal per table. Older servers fall back to "
+                 "legacy separate DIFF summaries and two diffs against the fork snapshot for "
+                 "conflict counts. Custom resolvers use the legacy row path and write over the "
+                 "SKIP result. Added tables/columns are reconciled first except in native-only "
+                 "mode. Data apply has per-table atomicity; schema and commit-log updates are "
+                 "separate. Actual paths and fallback reasons are recorded per operation",
         "rebase": ("re-fork: the branch's next generation is cloned from the upstream's head "
                    "snapshot and snapshotted (the new base); the branch's delta since its previous "
                    "base (a native diff of its own two snapshots) is copied in with SQL from "
@@ -913,14 +916,18 @@ class MatrixOneToolSuite(DBToolSuite):
         a, b = self._state(ref_a), self._state(ref_b)
         tables_a = {t for t in self._tables(a.db) if self._readable(a, t)}
         tables_b = {t for t in self._tables(b.db) if self._readable(b, t)}
+        if not (tables_a or tables_b):
+            self._record_execution("no_data_tables")
         out = []
         for table in sorted(tables_a | tables_b):
             if table in tables_a and table not in tables_b:
+                self._record_execution("table_diff_counts")
                 n = self._execute(f"SELECT COUNT(*) FROM {a.expr(table)}")[0][0]
                 out.append({"table_name": table, "rows_added": 0, "rows_deleted": int(n),
                             "rows_modified": 0})
                 continue
             if table in tables_b and table not in tables_a:
+                self._record_execution("table_diff_counts")
                 n = self._execute(f"SELECT COUNT(*) FROM {b.expr(table)}")[0][0]
                 out.append({"table_name": table, "rows_added": int(n), "rows_deleted": 0,
                             "rows_modified": 0})
@@ -934,11 +941,14 @@ class MatrixOneToolSuite(DBToolSuite):
                 # anti-joins over the common columns through time-travel
                 # reads, as the single-server adapters do.
                 if "schema compatibility check" not in str(e) or MO_NATIVE_DIFF_ONLY:
+                    self._record_execution("table_diff_summary")
                     raise
+                self._record_execution("sql_diff", fallback_reason="table_diff_summary: incompatible schema")
                 added, deleted, modified = self._sql_summary(a, b, table)
                 out.append({"table_name": table, "rows_added": added, "rows_deleted": deleted,
                             "rows_modified": modified, "simulated": True})
                 continue
+            self._record_execution("table_diff_summary")
             out.append({"table_name": table, "rows_added": bi + ad, "rows_deleted": bd + ai,
                         "rows_modified": bu + au,
                         "b_side": [bi, bd, bu], "a_side": [ai, ad, au]})
@@ -985,7 +995,8 @@ class MatrixOneToolSuite(DBToolSuite):
     # -- schema reconciliation (merge, rebase) -----------------------------
 
     def _reconcile_schema(self, ours_db: str, theirs: _State,
-                          ours_catalog: dict = None, theirs_catalog: dict = None) -> dict:
+                          ours_catalog: dict = None, theirs_catalog: dict = None,
+                          readable_tables=None) -> dict:
         """Give ours_db the tables and columns theirs has and it lacks; a
         differing primary key is a schema conflict (raised before any
         change)."""
@@ -995,7 +1006,8 @@ class MatrixOneToolSuite(DBToolSuite):
         # The current catalog already establishes visibility at the head.
         # Historical refs still need a probe: a current table may not have
         # existed at the requested snapshot.
-        theirs_tables = [t for t in theirs_catalog if not theirs.snap or self._readable(theirs, t)]
+        theirs_tables = (readable_tables if readable_tables is not None else
+                         {t for t in theirs_catalog if not theirs.snap or self._readable(theirs, t)})
         new_tables = sorted(set(theirs_tables) - ours)
         plan_cols = []
         for table in sorted(ours & set(theirs_tables)):
@@ -1020,8 +1032,6 @@ class MatrixOneToolSuite(DBToolSuite):
                 raise RuntimeError(f"Cannot read default expression for {table}.{name}")
         for table in new_tables:
             self._execute(f"DATA BRANCH CREATE TABLE {_qt(ours_db, table)} FROM {theirs.expr(table)};")
-            # A snapshot clone can have an older schema than the source's
-            # current catalog. New tables are excluded from the merge loop.
         for table, name, ctype, default in plan_cols:
             ddl = f"ALTER TABLE {_qt(ours_db, table)} ADD COLUMN {_quote(name)} {ctype} NULL"
             if default is not None:
@@ -1137,6 +1147,17 @@ class MatrixOneToolSuite(DBToolSuite):
 
     # -- merge --------------------------------------------------------------
 
+    def _native_path_unavailable(self, path: str, *, parser_rejected=False) -> None:
+        # Keep the original reason after capability negotiation disables a
+        # path, so subsequent operations do not misreport it as configured off.
+        reasons = self.__dict__.setdefault("_native_path_reasons", {})
+        if parser_rejected:
+            reasons[path] = f"{path}: server rejected syntax"
+            self._warn(("native_path", path),
+                       f"{path} is unsupported by this server; using the fallback path "
+                       "for this connection (see execution_paths and fallback_reasons)")
+        self._record_execution(fallback_reason=reasons.get(path, f"{path}: disabled"))
+
     def _merge_with_summary(self, source: str, target: str, policy: str):
         """Merge and return native pre-merge counts, or None if unsupported.
 
@@ -1145,16 +1166,21 @@ class MatrixOneToolSuite(DBToolSuite):
         must propagate without replaying the operation.
         """
         if self._merge_summary_supported is False:
+            self._native_path_unavailable("table_merge_summary")
             return None
         try:
             result = self._execute(f"DATA BRANCH MERGE {source} INTO {target} "
                                    f"WHEN CONFLICT {policy} OUTPUT SUMMARY")
-        except pymysql.MySQLError as exc:
-            if (self._merge_summary_supported is None and exc.args and exc.args[0] == 1064
+        except Exception as exc:
+            if (isinstance(exc, pymysql.MySQLError) and self._merge_summary_supported is None
+                    and exc.args and exc.args[0] == 1064
                     and re.search(r'syntax error at .*near [\'"]\s*output\b', str(exc), re.I)):
                 self._merge_summary_supported = False
+                self._native_path_unavailable("table_merge_summary", parser_rejected=True)
                 return None
+            self._record_execution("table_merge_summary")
             raise
+        self._record_execution("table_merge_summary")
         if not result or len(result) != 1 or len(result[0]) != 7:
             raise RuntimeError("Invalid MatrixOne MERGE OUTPUT SUMMARY result; merge was not retried")
         counts = tuple(int(n) for n in result[0])
@@ -1175,7 +1201,9 @@ class MatrixOneToolSuite(DBToolSuite):
             raise ValueError(f"Cannot merge branch '{source.branch}' into itself")
         rel = self._relation(ours_db, theirs.db)
         info = {"conflicts": 0, "conflict_tables": [], "merged_tables": [],
-                "ours_changes": 0, "theirs_changes": 0, "two_way": rel is None}
+                "ours_changes": 0, "theirs_changes": 0, "two_way": rel is None,
+                "merge_summary": "none"}
+        summary_modes = set()
         if rel is None:
             self._warn(("two_way", ours_db, theirs.db),
                        f"{theirs.db} and {ours_db} share no fork point: merging two-way")
@@ -1183,6 +1211,7 @@ class MatrixOneToolSuite(DBToolSuite):
         policy = "SKIP" if (want_rows or on_conflict == "ours") else "ACCEPT"
         ours_catalog = self._catalog(ours_db)
         theirs_catalog = self._catalog(theirs.db)
+        readable_tables = {t for t in theirs_catalog if not theirs.snap or self._readable(theirs, t)}
         if MO_NATIVE_MERGE_AS_IS:
             # Native-only mode: the engine's merge as it is. A column the
             # target lacks is left out of the result, a table only the
@@ -1190,18 +1219,24 @@ class MatrixOneToolSuite(DBToolSuite):
             # engine refuse (a failed merge, caught by the checks).
             schema = {"added_tables": [], "added_columns": []}
         else:
-            schema = self._reconcile_schema(ours_db, theirs, ours_catalog, theirs_catalog)
+            schema = self._reconcile_schema(ours_db, theirs, ours_catalog, theirs_catalog,
+                                            readable_tables=readable_tables)
         conflicts = []
         self._fk_checks(False)
         try:
-            for table in sorted(ours_catalog.keys() & theirs_catalog.keys()):
-                if table in schema["added_tables"] or (theirs.snap and not self._readable(theirs, table)):
-                    continue
+            # Added tables were already cloned, including their snapshot data.
+            tables = sorted((ours_catalog.keys() & readable_tables) - set(schema["added_tables"]))
+            if not tables:
+                self._record_execution("no_data_tables")
+            if want_rows and tables:
+                self._record_execution(fallback_reason="merge: custom resolver requires conflict rows")
+            for table in tables:
                 # Native summaries keep conflict rows on the server. A
                 # custom resolver still needs the legacy row-level path.
                 summary = None if want_rows else self._merge_with_summary(
                     theirs.expr(table), _qt(ours_db, table), policy)
                 if summary is not None:
+                    summary_modes.add("native")
                     source_counts, target_counts, n_conf = summary
                     info["ours_changes"] += sum(target_counts)
                     info["theirs_changes"] += sum(source_counts)
@@ -1211,6 +1246,8 @@ class MatrixOneToolSuite(DBToolSuite):
                         info["conflicts"] += n_conf
                         info["conflict_tables"].append(table)
                     continue
+                summary_modes.add("legacy")
+                self._record_execution("legacy_table_merge")
                 (ti, td, tu), (oi, od, ou) = self._summary(theirs.expr(table), _qt(ours_db, table))
                 info["ours_changes"] += oi + od + ou
                 info["theirs_changes"] += ti + td + tu
@@ -1242,6 +1279,7 @@ class MatrixOneToolSuite(DBToolSuite):
         finally:
             self._fk_checks(True)
         if conflicts:
+            self._record_execution("custom_resolver")
             info["resolved"] = "custom"
             info["resolution"] = on_conflict(self._conflict_session(into), conflicts)
         elif info["conflicts"]:
@@ -1257,6 +1295,8 @@ class MatrixOneToolSuite(DBToolSuite):
         # up to date) the source has nothing beyond it.
         info["fast_forward"] = info["ours_changes"] == 0 or info["theirs_changes"] == 0
         info["schema_changes"] = schema
+        info["merge_summary"] = (next(iter(summary_modes)) if len(summary_modes) == 1
+                                 else "mixed" if summary_modes else "none")
         return info
 
     # -- rebase -------------------------------------------------------------
@@ -1462,6 +1502,7 @@ class MatrixOneToolSuite(DBToolSuite):
         db = self._on(ref)
         row = self._find_commit(db, to)
         if row["db"] == db and MO_NATIVE_RESET:
+            self._record_execution("restore_database")
             self._execute(f"RESTORE DATABASE {_quote(db)} {{snapshot = '{row['snap']}'}};")
             self._current_db = None
             self._use(db)
@@ -1471,6 +1512,7 @@ class MatrixOneToolSuite(DBToolSuite):
             return
         fp = json.loads(row["schema_json"]) if row.get("schema_json") else None
         if row["db"] == db:
+            self._record_execution("legacy_reset")
             self._undo_since(db, _State(db, row["snap"]), fp)
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (int(row["seq"]),))
             return
@@ -1482,6 +1524,7 @@ class MatrixOneToolSuite(DBToolSuite):
             raise self._unsupported("reset", f"commit made on {row['db']}, another generation of the branch; "
                                              "RESTORE DATABASE needs the database's own snapshot")
         self._warn(("reset_sql", db), f"reset of {db} to a commit made on {row['db']}: rows restored with SQL")
+        self._record_execution("legacy_reset")
         self._restore_sql(db, _State(row["db"], row["snap"]), fp)
         self._execute(
             f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s "
@@ -1676,6 +1719,7 @@ class MatrixOneToolSuite(DBToolSuite):
             raise ValueError(f"commit {commit} has no predecessor to revert to")
         after = _State(row["db"], row["snap"])
         before = _State(row["prev_db"], row["prev_snap"])
+        self._record_execution("legacy_revert")
         try:
             self._execute("SET SESSION foreign_key_checks = 0")
         except Exception:

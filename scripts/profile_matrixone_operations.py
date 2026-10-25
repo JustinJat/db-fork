@@ -87,7 +87,11 @@ class SQLTrace:
             "statement_kinds": dict(Counter(" ".join(r["sql"].split()[:3]).upper()
                                             for r in self.records)),
             "queries": list(self.records),
+            "execution_paths": list(getattr(result, "execution_paths", [])),
+            "fallback_reasons": list(getattr(result, "fallback_reasons", [])),
         }
+        if isinstance(getattr(result, "value", None), dict) and "merge_summary" in result.value:
+            measurement["merge_summary"] = result.value["merge_summary"]
         if self.server_log:
             events = Counter()
             with self.server_log.open("rb") as log:
@@ -103,6 +107,18 @@ class SQLTrace:
             if operation in ("diff", "merge") and not events["DataBranch-HashDiff-Done"]:
                 raise RuntimeError("No HashDiff events captured; use an exclusive server with INFO JSON logging")
         return result, measurement
+
+
+def server_identity():
+    """Read build identity outside all measured operations."""
+    conn = mo.connect(None)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT version(), git_version()")
+            version, git_version = cur.fetchone()
+            return {"version": str(version), "git_version": str(git_version)}
+    finally:
+        conn.close()
 
 
 def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
@@ -187,7 +203,10 @@ def main():
         parser.error("--server-log must name an existing file")
     report = {
         "adapter_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "adapter_dirty": bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], text=True).strip()),
         "endpoint": f"{mo.MO_HOST}:{mo.MO_PORT}",
+        "server": server_identity(),
         "scope": "client COM_QUERY only; excludes setup, seed, cleanup, and handshake",
         "runs": [],
     }

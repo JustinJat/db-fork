@@ -61,6 +61,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
 
@@ -93,6 +94,9 @@ _VERB_OP_TYPES = {
     "reset": OpType.RESET,
     "delete": OpType.DELETE,
 }
+
+# Scoped to one public verb, including nested calls and concurrent workers.
+_execution_details = ContextVar("dbfork_execution_details", default=None)
 
 
 class OperationCancelled(RuntimeError):
@@ -176,6 +180,8 @@ class OpResult:
     value: Any = None
     error: str = ""
     note: str = ""
+    execution_paths: list[str] = field(default_factory=list)
+    fallback_reasons: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -744,6 +750,20 @@ class DBToolSuite(ABC):
         """Ref the sync connection is on."""
         return self._current_ref
 
+    def _record_execution(self, path: str = "", *, fallback_reason: str = "") -> None:
+        """Record observed backend choices, independently of static capabilities.
+
+        Paths are unique within a verb (not per-table counters). Failed rows
+        retain the path that failed; parser-rejected probes belong only in
+        fallback_reasons. Calls outside a public verb are not recorded.
+        """
+        details = _execution_details.get()
+        if details is None or details[0] is not self:
+            return
+        for value, values in ((path, details[1]), (fallback_reason, details[2])):
+            if value and value not in values:
+                values.append(value)
+
     def _run_verb(self, verb: str, fn: Callable, ref: Optional[Ref], *,
                   timed: bool, storage: Optional[bool], label: str,
                   raise_on_error: bool, fallback: bool = False) -> OpResult:
@@ -754,6 +774,8 @@ class DBToolSuite(ABC):
         start_wall = time.time()
         start = time.perf_counter()
         token = self._begin_op(verb.upper(), str(ref) if ref else "", label)
+        paths, reasons = [], []
+        execution_token = _execution_details.set((self, paths, reasons))
         try:
             if native_only() and not self._is_native(verb):
                 raise self._unsupported(verb, "simulated by the adapter; native-only mode")
@@ -763,6 +785,7 @@ class DBToolSuite(ABC):
         except Exception as e:
             status, error, exc = OpStatus.FAILED, f"{type(e).__name__}: {e}", e
         finally:
+            _execution_details.reset(execution_token)
             error = self._end_op(token, error)
         latency = time.perf_counter() - start if status != OpStatus.UNSUPPORTED else 0.0
         end_wall = time.time()
@@ -774,11 +797,13 @@ class DBToolSuite(ABC):
                 error_message=error, disk_size_before=before,
                 disk_size_after=after, commit_ref_fallback=fallback,
                 num_keys_touched=0,
+                execution_paths=paths, fallback_reasons=reasons,
             )
         result = OpResult(
             op=verb, status=status, ref=str(ref) if ref else "",
             latency=latency, storage_before=before, storage_after=after,
             value=value, error=error,
+            execution_paths=paths, fallback_reasons=reasons,
         )
         if raise_on_error and exc is not None:
             raise exc

@@ -96,6 +96,10 @@ def run_point(point_id, verb, params, suite, backend, spine, point_branch, *, re
                 if res is not None:
                     rep["status"] = res.status_name
                     rep["latency"] = res.latency
+                    rep["execution_paths"] = list(res.execution_paths)
+                    rep["fallback_reasons"] = list(res.fallback_reasons)
+                    if isinstance(res.value, dict) and "merge_summary" in res.value:
+                        rep["merge_summary"] = res.value["merge_summary"]
                     if isinstance(res.value, dict) and "parallel" in res.value:
                         rep["per_delete"] = res.value["per_delete"]
                         rep["sum_latency"] = res.value["sum"]
@@ -227,6 +231,7 @@ def main(argv=None):
              "implementation": _implementation_for(backend), "setup": {}, "points": [], "status": "running"}
 
     def save():
+        stats.update(collector.execution_summary())
         with open(stats_path, "w") as f:
             json.dump(stats, f, indent=1, default=str)
 

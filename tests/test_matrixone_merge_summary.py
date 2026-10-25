@@ -10,6 +10,7 @@ from dblib.matrixone import MatrixOneToolSuite
 
 def suite():
     s = object.__new__(MatrixOneToolSuite)
+    s._warned = set()
     s._merge_summary_supported = None
     return s
 

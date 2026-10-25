@@ -127,6 +127,8 @@ RESULT_SCHEMA = pa.schema(
         ("start_time", pa.float64()),
         ("end_time", pa.float64()),
         ("pool_wait_time", pa.float64()),
+        ("execution_paths", pa.list_(pa.string())),
+        ("fallback_reasons", pa.list_(pa.string())),
     ]
 )
 
@@ -159,6 +161,8 @@ def _row_dict(result) -> dict:
         "start_time": result.start_time,
         "end_time": result.end_time,
         "pool_wait_time": result.pool_wait_time,
+        "execution_paths": list(result.execution_paths),
+        "fallback_reasons": list(result.fallback_reasons),
     }
 
 
@@ -193,6 +197,8 @@ class ResultCollector:
         self._spilled_rows = 0
         # Per-op-type status counts over every row emitted (spilled or not)
         self._status_counts: dict = {}
+        self._execution_path_counts: dict = {}
+        self._fallback_reason_counts: dict = {}
         # Operations in flight: token -> {op, ref, label, thread_id, start,
         # cancel (callable or None), note (set when a watchdog cancelled it)}
         self._in_flight: dict = {}
@@ -269,6 +275,8 @@ class ResultCollector:
             self.failed_operations = []
             self.unsupported_ops = set()
             self._status_counts = {}
+            self._execution_path_counts = {}
+            self._fallback_reason_counts = {}
         with self._spill_lock:
             path = self._close_spill()
             self._spilled_rows = 0
@@ -435,6 +443,8 @@ class ResultCollector:
         commit_ref_fallback: bool = False,
         num_keys_touched: int = None,
         pool_wait_time: float = None,
+        execution_paths=None,
+        fallback_reasons=None,
     ) -> None:
         """Append one Result row, filled from the arguments plus the calling
         thread's driver context. Consumes the pending num_keys_touched and
@@ -478,6 +488,8 @@ class ResultCollector:
             result.disk_size_before = disk_size_before
             result.disk_size_after = disk_size_after
             result.commit_ref_fallback = commit_ref_fallback
+            result.execution_paths.extend(dict.fromkeys(execution_paths or []))
+            result.fallback_reasons.extend(dict.fromkeys(fallback_reasons or []))
             result.num_keys_touched = (
                 state.num_keys_touched
                 if num_keys_touched is None
@@ -494,6 +506,14 @@ class ResultCollector:
                 c = self._status_counts.setdefault(
                     rslt.OpType.Name(op_type), {"ok": 0, "unsupported": 0, "failed": 0})
                 c[_status_bucket(status)] += 1
+                op = rslt.OpType.Name(op_type)
+                for path in result.execution_paths:
+                    counts = self._execution_path_counts.setdefault(op, {}).setdefault(
+                        path, {"ok": 0, "unsupported": 0, "failed": 0})
+                    counts[_status_bucket(status)] += 1
+                for reason in result.fallback_reasons:
+                    counts = self._fallback_reason_counts.setdefault(op, {})
+                    counts[reason] = counts.get(reason, 0) + 1
                 batch = None
                 if self.spill_rows and len(self.results) >= self.spill_rows:
                     batch, self.results = self.results, []
@@ -559,7 +579,19 @@ class ResultCollector:
             "workflow_supported": not unsupported,
             "unsupported_ops": unsupported,
             "op_status_counts": counts,
+            **self.execution_summary(),
         }
+
+    def execution_summary(self) -> dict:
+        """Observed paths for recorded operations, including spilled rows."""
+        with self._lock:
+            return {
+                "execution_path_counts": {
+                    op: {path: dict(counts) for path, counts in paths.items()}
+                    for op, paths in self._execution_path_counts.items()},
+                "fallback_reason_counts": {
+                    op: dict(counts) for op, counts in self._fallback_reason_counts.items()},
+            }
 
     def write_to_parquet(self, filename: str = None, append: bool = True):
         """Write all collected rows to a parquet file, appending if it
@@ -590,7 +622,12 @@ class ResultCollector:
                     for src in (filepath, spilled):
                         pf = pq.ParquetFile(src)
                         for i in range(pf.num_row_groups):
-                            t = pf.read_row_group(i).cast(RESULT_SCHEMA)
+                            t = pf.read_row_group(i)
+                            # Older result files lack newly added optional fields.
+                            for field in RESULT_SCHEMA:
+                                if field.name not in t.column_names:
+                                    t = t.append_column(field.name, pa.nulls(len(t), type=field.type))
+                            t = t.select(RESULT_SCHEMA.names).cast(RESULT_SCHEMA)
                             w.write_table(t)
                             total += len(t)
                 os.replace(tmp, filepath)

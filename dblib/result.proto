@@ -79,6 +79,14 @@ message Result {
   // Async mode: time spent waiting for a free pool connection before the
   // operation started (seconds). Not included in latency.
   double pool_wait_time = 25;
+
+  // Observed backend paths, unique per verb; empty if uninstrumented or no
+  // path was reached. On FAILED rows these include the path that errored.
+  repeated string execution_paths = 26;
+
+  // Why preferred paths were bypassed (disabled, parser rejection, schema,
+  // custom resolver). Rejected probes are not listed as executed paths.
+  repeated string fallback_reasons = 27;
 }
 
 enum OpType {
