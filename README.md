@@ -1615,6 +1615,63 @@ selection, and exclusion of history seeding/validation from operation timings.
 This step adds profiling and test coverage; the production adapter and server
 implementations remain those from the preceding step.
 
+The adapter now reads both endpoints' latest fork/rebase/root log rows with
+one `UNION ALL` statement. Each endpoint has its own `ORDER BY seq DESC LIMIT 1`
+subquery, and an input-position tag routes the results independently of UNION
+execution order. Missing fork points still raise an error naming that endpoint;
+server failures propagate. Relationship selection still uses the newest
+matching fork/rebase row and recognizes earlier generations of a branch.
+
+MERGE's fork-point reads fall from two statements to one. Rebase reuses those
+same rows to obtain its own base, reducing three reads to one. Results are
+local to that operation; a later call reads fresh rows. Catalog and post-merge
+schema fingerprint queries retain their existing behavior.
+
+For the operation profiler's standard workload, client MERGE counts are now:
+
+| MERGE interface | 1 table: before → after | 10 tables: before → after |
+| --- | ---: | ---: |
+| Legacy | 18 → 17 | 63 → 62 |
+| Table summary | 14 → 13 | 23 → 22 |
+| Database summary | 14 → 13 | 14 → 13 |
+
+Measured on 2026-10-25 against the same `d33aa9d38` server: clean adapter
+`fe50d0d` first, then that revision with the fork-point change applied. The
+after JSON records a dirty tree and the adapter source hash. Each version ran
+three repetitions per interface/table count, alternating interface order,
+with the standard 1,000-row / 100-source-change UPDATE workflow. Medians in ms:
+
+| Interface / tables | Complete MERGE: before → after | Fork-point reads: before → after |
+| --- | ---: | ---: |
+| Legacy / 1 | 177 → 191 | 2.53 → 2.48 |
+| Table summary / 1 | 138 → 135 | 2.13 → 1.75 |
+| Database / 1 | 128 → 145 | 2.41 → 2.17 |
+| Legacy / 10 | 795 → 834 | 2.40 → 2.49 |
+| Table summary / 10 | 331 → 361 | 2.31 → 2.32 |
+| Database / 10 | 273 → 262 | 2.33 → 2.41 |
+
+The established benefit is one fewer client statement per MERGE and two fewer
+per rebase. These small local samples do not establish a latency improvement:
+fork-point reads remain around 2 ms and whole-operation medians move in both
+directions. All 36 workflows pass merge/conflict/revert/reset checks, retain
+their execution paths and returned-row counts, and have complete server
+timings. Reproduce with the same server and each adapter revision separately:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --reps 3 \
+  --modes legacy summary database --server-log /tmp/mo.json.log \
+  --out /tmp/mo-fork-point-profile.json
+```
+
+All 129 MatrixOne adapter tests pass, including live rebase and subsequent
+merge after a generation change, reverse-direction rebase, custom resolvers,
+snapshot references, reset, and revert. New coverage checks shuffled UNION
+results, repeated/case-alias inputs, quoted database names, missing fork
+points, error propagation, latest-row selection, and reuse without caching
+across operations. A traced rebase confirms one ancestry query returning two
+rows. This step changes only the adapter.
+
 In a separate traced run of the 10-table UPDATE workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation

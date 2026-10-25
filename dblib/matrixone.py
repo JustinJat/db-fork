@@ -639,20 +639,38 @@ class MatrixOneToolSuite(DBToolSuite):
         """The branch's latest fork/rebase/root row: ``snap`` is the branch's
         own snapshot of that state, ``prev_snap``/``prev_db`` the parent's
         (upstream's) snapshot it was cloned from."""
-        rows = self._execute(
-            f"SELECT {', '.join(self._LOG_COLS)} FROM {_qt(db, COMMITS_TABLE)} "
-            "WHERE kind IN ('fork', 'rebase', 'root') ORDER BY seq DESC LIMIT 1")
-        if not rows:
-            raise ValueError(f"{db} has no fork point recorded")
-        return dict(zip(self._LOG_COLS, rows[0]))
+        return self._base_rows(db)[0]
 
-    def _relation(self, x_db: str, y_db: str):
+    def _base_rows(self, *dbs: str) -> list[dict]:
+        """Read each endpoint's latest fork point in one statement, in input order.
+
+        Each LIMIT applies to its own log. Input tags preserve order even when
+        UNION execution interleaves rows, or two inputs name the same database.
+        Results belong to this operation; a later merge/rebase reads them again.
+        """
+        if not dbs:
+            return []
+        columns = ", ".join(self._LOG_COLS)
+        sql = " UNION ALL ".join(
+            f"SELECT {index} AS endpoint, {columns} FROM "
+            f"(SELECT {columns} FROM {_qt(db, COMMITS_TABLE)} "
+            "WHERE kind IN ('fork', 'rebase', 'root') ORDER BY seq DESC LIMIT 1) AS base_row"
+            for index, db in enumerate(dbs))
+        out = [None] * len(dbs)
+        for index, *values in self._execute(sql) or []:
+            out[index] = dict(zip(self._LOG_COLS, values))
+        for db, row in zip(dbs, out):
+            if row is None:
+                raise ValueError(f"{db} has no fork point recorded")
+        return out
+
+    def _relation(self, x_db: str, y_db: str, base_rows: list[dict] = None):
         """(child_db, parent_db, base_row) for the most recent fork/rebase
         that made one of the two databases a clone of the other, or None
         when neither descends from the other."""
+        x_base, y_base = self._base_rows(x_db, y_db) if base_rows is None else base_rows
         cands = []
-        for child, parent in ((x_db, y_db), (y_db, x_db)):
-            row = self._base_row(child)
+        for child, parent, row in ((x_db, y_db, x_base), (y_db, x_db, y_base)):
             # prev_db names the parent's generation at fork/rebase time.
             if (row["kind"] in ("fork", "rebase")
                     and branch_of_db(self.db_name, row["prev_db"]) == branch_of_db(self.db_name, parent)):
@@ -1450,8 +1468,9 @@ class MatrixOneToolSuite(DBToolSuite):
         # when a spine is rebased onto one of its own branches) the
         # upstream's fork of the branch. Either way s_b0 is the branch's
         # own snapshot of that state and up_base the upstream's.
-        rel = self._relation(branch_db, onto_db)
-        base_row = self._base_row(branch_db)
+        base_rows = self._base_rows(branch_db, onto_db)
+        rel = self._relation(branch_db, onto_db, base_rows)
+        base_row = base_rows[0]
         if rel is None:
             self._warn(("rebase_two_way", branch_db),
                        f"{branch_db} and {onto_db} share no fork point: upstream conflicts not detected")

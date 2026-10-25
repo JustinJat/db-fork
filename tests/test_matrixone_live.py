@@ -170,7 +170,7 @@ def test_profiler_long_history_preserves_workflow_and_times_only_merge(mode, cop
     assert timing["log_copy_calls"] == 1
     assert 0 < timing["log_copy_ms"] < timing["total_ms"]
     assert timing["log_copy_ms"] + timing["other_ms"] == pytest.approx(merge["elapsed_ms"])
-    assert merge["statements"] == {"legacy": 23, "summary": 15, "database": 14}[mode]
+    assert merge["statements"] == {"legacy": 22, "summary": 14, "database": 13}[mode]
     assert merge["merge_summary"] == ("legacy" if mode == "legacy" else "native")
     copy_queries = [q for q in merge["queries"] if "AND NOT EXISTS" in q["sql"]]
     assert len(copy_queries) == 1
@@ -189,6 +189,38 @@ def test_implementation_summary():
     assert impl["revert"] == ("native" if matrixone.MO_DATABASE_RESTORE else "simulated")
     assert set(impl) >= {"branch", "commit", "diff", "log", "merge", "rebase", "revert",
                          "reset", "delete", "commit_refs", "multi_ref_exec"}
+
+
+@needs_simulated
+def test_paired_fork_points_stay_current_across_rebase(suite):
+    from scripts.profile_matrixone_operations import SQLTrace
+
+    assert suite.commit("main", "base").ok
+    assert suite.branch("fork_pair", "main").ok
+    source = suite._db_for("fork_pair")
+    # Newer commit rows must not hide either endpoint's latest fork/root row.
+    suite.exec(["UPDATE t SET n=20 WHERE id=2"], refs=["fork_pair"], raise_on_error=True)
+    assert suite.commit("fork_pair", "branch work").ok
+    suite.exec(["UPDATE t SET n=30 WHERE id=3"], refs=["main"], raise_on_error=True)
+    assert suite.commit("main", "upstream work").ok
+    dbs = [source, DB, source.upper()]
+    expected = [next(r for r in suite._log_rows(db) if r["kind"] in ("root", "fork", "rebase"))
+                for db in dbs]
+    assert suite._base_rows(*dbs) == expected
+    with SQLTrace(suite.conn) as trace:
+        result, measurement = trace.measure("rebase", lambda: suite.rebase("fork_pair", "main"))
+    assert result.ok, result.error
+    queries = [q for q in measurement["queries"] if "kind IN ('fork', 'rebase', 'root')" in q["sql"]]
+    assert len(queries) == 1
+    assert queries[0]["returned_rows"] == 2
+    new_source = suite._db_for("fork_pair")
+    assert new_source != source
+    new_bases = suite._base_rows(new_source, DB)
+    assert new_bases[0]["kind"] == "rebase" and new_bases[0]["seq"] > expected[0]["seq"]
+    assert suite._relation(new_source, DB) == (new_source, DB, new_bases[0])
+    assert rows(suite, "fork_pair", "SELECT id,n FROM t ORDER BY id") == [(1, 1), (2, 20), (3, 30)]
+    assert suite.merge("main", "fork_pair").ok
+    assert rows(suite, "main", "SELECT id,n FROM t ORDER BY id") == [(1, 1), (2, 20), (3, 30)]
 
 
 @needs_simulated

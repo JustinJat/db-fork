@@ -16,6 +16,84 @@ def suite():
     return s
 
 
+def fork_row(seq, kind="fork", parent="parent"):
+    row = dict.fromkeys(mo.MatrixOneToolSuite._LOG_COLS)
+    row.update(seq=seq, id=f"c{seq}", kind=kind, db="child", snap=f"s{seq}",
+               prev_db=parent, prev_snap="base", schema_json="{}")
+    return row
+
+
+def test_base_rows_preserve_input_order_and_independent_alias_results():
+    s = suite()
+    first, second = fork_row(10), fork_row(20, "rebase")
+    s._execute = Mock(return_value=[(1, *second.values()), (2, *first.values()), (0, *first.values())])
+    rows = s._base_rows("quoted`db", "other", "quoted`db")
+    assert rows == [first, second, first]
+    rows[0]["snap"] = "changed"
+    assert rows[2]["snap"] == first["snap"]
+    s._execute.assert_called_once()
+    assert "`quoted``db`.`_bb_commits`" in s._execute.call_args.args[0]
+
+
+def test_base_rows_without_inputs_do_not_query():
+    s = suite()
+    s._execute = Mock()
+    assert s._base_rows() == []
+    s._execute.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", [0, 1])
+def test_base_rows_name_the_endpoint_with_no_fork_point(missing):
+    s = suite()
+    s._execute = Mock(return_value=[(1 - missing, *fork_row(10).values())])
+    with pytest.raises(ValueError, match=f"{('left', 'right')[missing]} has no fork point"):
+        s._base_rows("left", "right")
+    s._execute.assert_called_once()
+
+
+def test_base_rows_propagate_server_errors_without_retry():
+    s = suite()
+    s._execute = Mock(side_effect=pymysql.OperationalError(1142, "access denied"))
+    with pytest.raises(pymysql.OperationalError, match="access denied"):
+        s._base_rows("left", "right")
+    s._execute.assert_called_once()
+
+
+@pytest.mark.parametrize("left_seq,right_seq,left_kind,right_kind,expected", [
+    (10, 20, "fork", "rebase", "right"),
+    (30, 20, "rebase", "fork", "left"),
+    (10, 10, "fork", "fork", "left"),
+    (30, 20, "root", "fork", "right"),
+    (30, 20, "root", "root", None),
+])
+def test_relation_selects_latest_matching_generation(left_seq, right_seq, left_kind, right_kind, expected):
+    s = suite()
+    s.db_name = "bench"
+    left, right = mo.gen_db_name("bench", "left", 3), mo.gen_db_name("bench", "right", 4)
+    bases = [fork_row(left_seq, left_kind, mo.gen_db_name("bench", "right", 1)),
+             fork_row(right_seq, right_kind, mo.gen_db_name("bench", "left", 2))]
+    s._base_rows = Mock(return_value=bases)
+    relation = s._relation(left, right)
+    assert relation == (None if expected is None else
+                        (left, right, bases[0]) if expected == "left" else (right, left, bases[1]))
+    s._base_rows.assert_called_once_with(left, right)
+    s._base_rows.reset_mock()
+    assert s._relation(left, right, bases) == relation
+    s._base_rows.assert_not_called()
+
+
+def test_relation_does_not_retain_unrelated_or_old_fork_points():
+    s = suite()
+    s.db_name = "bench"
+    left, right = mo.gen_db_name("bench", "left", 1), mo.gen_db_name("bench", "right", 1)
+    unrelated = [fork_row(1, parent="unrelated"), fork_row(2, parent="unrelated")]
+    related = [fork_row(3, parent=right), unrelated[1]]
+    s._base_rows = Mock(side_effect=[unrelated, related])
+    assert s._relation(left, right) is None
+    assert s._relation(left, right) == (left, right, related[0])
+    assert s._base_rows.call_count == 2
+
+
 def test_catalog_preserves_pk_order_and_column_defaults():
     s = suite()
     s._execute = Mock(return_value=[
