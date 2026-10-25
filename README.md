@@ -1029,6 +1029,45 @@ MO_PORT=16001 python -m scripts.profile_matrixone_operations \
   --out /tmp/mo-stage-profile.json
 ```
 
+MO commit `5a2943202` removes insert staging from MERGE. Ordinary inserts now
+use one batched `INSERT INTO target (columns) VALUES ...` through the same
+transaction/statement executor used by staged writes. This retains RC retry
+handling and rollback, including rollback of earlier tables when a later
+table fails. UPDATE and DELETE still use their on-demand stages; PICK, portable
+SQL output, and the existing keyless/exact-float insert paths are unchanged.
+
+Compared with `500f53066`, this removes three staging DDL statements per table
+that needs ordinary inserts, and reduces each insert batch from three DML
+statements (stage load, INSERT SELECT, stage clear) to one. Thus INSERT-only
+MERGE creates no stages, INSERT+UPDATE uses one, and INSERT+DELETE+UPDATE uses
+two. These are server-generated statements; client SQL counts do not change.
+
+A fresh comparison on 2026-10-25 used baseline `500f53066`, direct-insert build
+`5a2943202`, and the same clean adapter `ac82249`. The workload and procedure
+were the same as above: three repetitions per interface/table count, alternating
+interface order, with the baseline server measured first. Medians in ms:
+
+| Interface / tables | Client merge before → after | Server merge before → after | Stage init + cleanup before → after |
+| --- | ---: | ---: | ---: |
+| Table summary / 1 | 245 → 227 | 113 → 83 | 32 → 20 |
+| Database / 1 | 270 → 230 | 114 → 88 | 44 → 21 |
+| Table summary / 10 | 1274 → 933 | 1139 → 744 | 361 → 198 |
+| Database / 10 | 1199 → 896 | 1046 → 756 | 357 → 205 |
+
+In this sample, ten-table client latency fell about 27% for table summaries
+and 25% for database MERGE. This is a small local diagnostic comparison, not a
+throughput or tail-latency result. Client statement counts remain 24/15 for
+ten-table table/database merges and 15 for both one-table modes. The same
+profiler command above reproduces the workflow; use separate logs/output files
+for the two server revisions.
+
+Regression checks cover precise decimals, binary values, ENUM, NULL, generated
+columns, defaults, source-added columns, unique constraint failures, explicit
+transaction rollback, and database-wide rollback after a later table fails.
+The engine's existing schema compatibility rules still apply; the adapter
+continues to reconcile schema before native merge. Live checks also confirmed
+zero staging time for insert-only merges across all three MERGE interfaces.
+
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
