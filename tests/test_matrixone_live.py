@@ -155,6 +155,33 @@ def test_copy_log_deduplicates_both_keys_and_preserves_cutoff_and_rollback(suite
             suite._execute(f"DROP DATABASE IF EXISTS `{db}`")
 
 
+@pytest.mark.parametrize("mode", ["legacy", "summary", "database"])
+@pytest.mark.parametrize("copy", ["legacy_or", "adapter"])
+def test_profiler_long_history_preserves_workflow_and_times_only_merge(mode, copy):
+    from scripts.profile_matrixone_operations import run_once
+
+    run = run_once(2, 13, 5, mode, history_rows=11, log_copy=copy)
+    assert run["log_copy"] == copy and run["history_rows"] == 11
+    assert run["history"]["synthetic_shared_rows"] == 9
+    assert run["history"]["source_rows_before_merge"] > 11
+    assert run["history"]["destination_rows_before_merge"] > 9
+    merge = next(m for m in run["measurements"] if m["operation"] == "merge")
+    timing = merge["client_merge_timing"]
+    assert timing["log_copy_calls"] == 1
+    assert 0 < timing["log_copy_ms"] < timing["total_ms"]
+    assert timing["log_copy_ms"] + timing["other_ms"] == pytest.approx(merge["elapsed_ms"])
+    assert merge["statements"] == {"legacy": 23, "summary": 15, "database": 14}[mode]
+    assert merge["merge_summary"] == ("legacy" if mode == "legacy" else "native")
+    copy_queries = [q for q in merge["queries"] if "AND NOT EXISTS" in q["sql"]]
+    assert len(copy_queries) == 1
+    assert (" OR " in copy_queries[0]["sql"]) == (copy == "legacy_or")
+    # The wrapper includes the traced query; seed INSERTs and validation SQL
+    # must not leak into any operation's measured query list.
+    assert copy_queries[0]["elapsed_ms"] <= timing["log_copy_ms"]
+    assert not any("profile-history-" in q["sql"] or "COUNT(DISTINCT id)" in q["sql"]
+                   for m in run["measurements"] for q in m["queries"])
+
+
 @needs_simulated
 def test_implementation_summary():
     impl = matrixone.MatrixOneToolSuite.implementation()

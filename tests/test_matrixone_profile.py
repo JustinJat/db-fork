@@ -3,10 +3,31 @@
 from copy import deepcopy
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from scripts.profile_matrixone_operations import SQLTrace, summarize_merge_timings
+
+
+@pytest.mark.parametrize("options", [{"history_rows": -1}, {"log_copy": "unknown"}])
+def test_invalid_history_options_do_not_create_databases(options):
+    from scripts.profile_matrixone_operations import run_once
+
+    backend = Mock()
+    with pytest.raises(ValueError):
+        run_once(1, 10, 5, "database", backend=backend, **options)
+    backend.setup_database.assert_not_called()
+
+
+def test_history_sequence_guard_checks_both_logs_before_inserting():
+    from scripts.profile_matrixone_operations import seed_merge_history
+
+    suite = Mock()
+    suite._execute.side_effect = [[(3, 1000)], [(4, 10)]]
+    with pytest.raises(ValueError, match="overlap"):
+        seed_merge_history(suite, "target", "source", "base", 10)
+    suite.conn.cursor.assert_not_called()
 
 
 def events(request_id="r", tables=2, status="ok"):

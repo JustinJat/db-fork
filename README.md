@@ -1535,6 +1535,86 @@ cutoffs (including zero), every copied field, repeat copies, fresh history,
 and rollback. All 108 MatrixOne adapter tests pass, including the live tests.
 This step changes only the adapter.
 
+The operation profiler also measures the log-copy change inside a complete
+MERGE. `--history-rows` adds synthetic old commit rows just before MERGE, with
+90% already present on the destination. Their sequence numbers precede all
+real commits, and they reuse the real base commit's snapshot and schema. This
+models larger logs; it does not model thousands of distinct snapshots or data
+versions. Source/destination log sizes include the workflow's existing rows
+as well: a 10,000-row seed produces 10,004 source and 9,003 destination rows
+before merging. The `_bb_commit_id` index remains enabled.
+
+`--log-copy legacy_or adapter` changes only the benchmark suite's log-copy
+implementation during MERGE. `legacy_or` runs the previous SQL, while `adapter`
+calls the current `_copy_log`. This option is separate from `--modes`, which
+selects the native MERGE interface. Every trial uses fresh scratch databases
+and checks conflicts, copied history, merged data, revert, and reset. Seeding
+and checks are outside measurements. The whole adapter MERGE, including log
+copying, recording the merge commit, and creating its snapshot, is timed.
+
+Measured on 2026-10-25 with server `d33aa9d38`, adapter `3389618`, and this
+profiler extension. The JSON records a dirty tree for the profiler change,
+plus source hashes. The adapter implementation itself is unchanged. Each
+table has 1,000 rows; the source updates 100 and inserts one, the destination
+updates 50, and conflict policy is `ours`. Three repetitions per combination
+alternate the old/new order. Database-level MERGE medians in ms:
+
+| Data tables | Added source log rows | Complete MERGE: old → new | Log-copy phase: old → new | Whole MERGE speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0 | 131 → 128 | 6.3 → 7.8 | 1.02× |
+| 1 | 1,000 | 157 → 125 | 55.4 → 9.8 | 1.26× |
+| 1 | 10,000 | 2944 → 180 | 2787.7 → 28.9 | 16.32× |
+| 10 | 0 | 276 → 261 | 7.0 → 7.9 | 1.06× |
+| 10 | 1,000 | 287 → 285 | 35.5 → 9.5 | 1.01× |
+| 10 | 10,000 | 3023 → 343 | 2710.0 → 40.0 | 8.81× |
+
+The log-copy phase here includes normal autocommit and the workflow's real
+schema payloads. The earlier statement microbenchmark used `{}` schema
+payloads inside an explicit transaction, excluding its BEGIN/ROLLBACK.
+
+The earlier 156× figure is a log-statement microbenchmark result. The complete
+MERGE improves about 16× with one table and 9× with ten tables in this
+10,000-row-history experiment. Short-history results show no dependable
+end-to-end improvement: local timing variation can absorb the smaller log-copy
+savings, as the ten-table / 1,000-row case illustrates. These are small local
+samples, not general latency guarantees.
+
+At 10,000 history rows, the remainder of MERGE stayed roughly constant:
+157 → 157 ms with one table and 308 → 304 ms with ten. In the ten-table result,
+the server's native MERGE was 160 → 166 ms; catalog and post-merge fingerprint
+queries still account for roughly 74 ms after the change. All database-level
+trials issued 14 client statements. `client_merge_timing` records `total_ms`,
+`log_copy_ms`, `other_ms`, and `log_copy_calls` per run. The two phase values
+sum to the total for each run; separately calculated medians need not add up.
+Server phase timings are included in `other_ms`, so they must not be added
+again to the client total.
+
+The same 10-table / 10,000-history-row workload also improves with the other
+MERGE interfaces (three repetitions each, medians in ms):
+
+| MERGE interface | Complete MERGE: old → new | Whole MERGE speedup | Client SQL: old → new |
+| --- | ---: | ---: | ---: |
+| Legacy | 3576 → 886 | 4.04× | 63 → 63 |
+| Table summary | 3039 → 384 | 7.91× | 23 → 23 |
+| Database summary | 3023 → 343 | 8.81× | 14 → 14 |
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --history-rows 0 1000 10000 \
+  --log-copy legacy_or adapter --modes database --reps 3 \
+  --server-log /tmp/mo.json.log --out /tmp/mo-log-e2e.json
+```
+
+To reproduce the additional interface controls, use `--tables 10
+--history-rows 10000 --modes legacy summary` with the same remaining options.
+All 48 workflows passed data/conflict/history/revert/reset checks and had
+complete server timing records. The 27 focused profiler tests passed, including
+six live workflows crossing all three interfaces and both copy strategies.
+Tests check history-sequence protection, unchanged SQL counts, actual strategy
+selection, and exclusion of history seeding/validation from operation timings.
+This step adds profiling and test coverage; the production adapter and server
+implementations remain those from the preceding step.
+
 In a separate traced run of the 10-table UPDATE workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation

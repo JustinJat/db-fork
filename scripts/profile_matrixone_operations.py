@@ -18,10 +18,17 @@ totals include table timings and transaction finish; do not add table totals
 again. Missing or incomplete timing logs are explicitly marked in the JSON.
 --mutation delete replaces source updates with deletions; both workloads insert
 one source row and update half the changed keys on the destination (conflicts).
+--history-rows adds synthetic old commit-log rows immediately before MERGE,
+with 90% already on the destination. Rows reuse the real base snapshot; this
+models log size, not thousands of independent snapshots or data versions.
+--log-copy legacy_or adapter compares the former log-copy SQL with the current
+adapter inside complete workflows. This is independent of --modes (the native
+MERGE interface). Seeding and history checks are outside operation timings.
 """
 
 import argparse
 from collections import Counter
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -32,6 +39,7 @@ import uuid
 from dblib import matrixone as mo
 from dblib import result_collector as rc
 from dblib.db_api import Ref
+from scripts.profile_matrixone_commit_log import legacy_copy_sql
 
 
 def summarize_merge_timings(records, expected_requests):
@@ -204,12 +212,57 @@ def server_identity():
         conn.close()
 
 
-def run_once(table_count, rows, changed, mode, backend=mo, server_log=None, mutation="update"):
+def seed_merge_history(suite, target, source, base_commit, count):
+    """Seed only the scratch workflow's logs, without changing their real heads."""
+    if count <= 0:
+        raise ValueError("history seed count must be positive")
+    shared = count * 9 // 10
+    template = suite._find_commit(target, base_commit)
+    before = {}
+    # Check both logs before writing either. Low sequences keep all synthetic
+    # entries before real commits, including the commits reverted/reset below.
+    for db in (target, source):
+        total, first = suite._execute(
+            f"SELECT COUNT(*), MIN(seq) FROM {mo._qt(db, mo.COMMITS_TABLE)}")[0]
+        if first is None or int(first) <= count:
+            raise ValueError("synthetic history would overlap the real commit sequence range")
+        before[db] = int(total)
+    columns = ", ".join(suite._LOG_COLS)
+    for db, size in ((source, count), (target, shared)):
+        for start in range(1, size + 1, 1000):
+            values = [(i, f"profile-history-{i:x}", "commit", "synthetic profiling history",
+                       template["snap"], template["db"], template["prev_snap"], template["prev_db"],
+                       template["ts"], template["schema_json"])
+                      for i in range(start, min(size + 1, start + 1000))]
+            with suite.conn.cursor() as cur:
+                cur.executemany(f"INSERT INTO {mo._qt(db, mo.COMMITS_TABLE)} ({columns}) "
+                                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+    return {"synthetic_source_rows": count, "synthetic_shared_rows": shared,
+            "source_rows_before_merge": before[source] + count,
+            "destination_rows_before_merge": before[target] + shared,
+            "template_commit": base_commit, "template_snapshot": template["snap"]}
+
+
+def check_merge_history(suite, target, count):
+    stats = suite._execute(
+        f"SELECT COUNT(*), COUNT(DISTINCT id), COALESCE(SUM(seq),0) "
+        f"FROM {mo._qt(target, mo.COMMITS_TABLE)} WHERE seq BETWEEN 1 AND %s", (count,))[0]
+    if tuple(map(int, stats)) != (count, count, count * (count + 1) // 2):
+        raise AssertionError(("copied history", stats, count))
+
+
+def run_once(table_count, rows, changed, mode, backend=mo, server_log=None, mutation="update",
+             history_rows=0, log_copy="adapter"):
     if mutation not in ("update", "delete"):
         raise ValueError(f"unsupported mutation: {mutation}")
+    if history_rows < 0:
+        raise ValueError("history_rows must be nonnegative")
+    if log_copy not in ("adapter", "legacy_or"):
+        raise ValueError(f"unsupported log_copy: {log_copy}")
     db = "bb_mop_" + uuid.uuid4().hex[:10]
     suite = None
     measurements = []
+    history = None
     try:
         backend.setup_database(db)
         suite = backend.MatrixOneToolSuite.init_for_bench(rc.ResultCollector(), db)
@@ -255,7 +308,41 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None, muta
                               for i in range(table_count)], refs=["main"])[0])
             check(suite.commit("main", "main work"))
             measure("diff", lambda: suite.diff(f"main@{base}", f"feature@{feature}"))
-            merged = measure("merge", lambda: suite.merge("main", "feature", on_conflict="ours"))
+            if history_rows:
+                target, source = suite._db_for("main"), suite._db_for("feature")
+                history = seed_merge_history(suite, target, source, base, history_rows)
+            original_copy = suite._copy_log
+            copy_times = []
+
+            def copy_log(into_db, from_db, max_seq=None):
+                start = time.perf_counter()
+                try:
+                    if log_copy == "adapter":
+                        return original_copy(into_db, from_db, max_seq=max_seq)
+                    sql = legacy_copy_sql(into_db, from_db)
+                    if max_seq is not None:
+                        sql += f" AND s.seq <= {int(max_seq)}"
+                    return suite._execute(sql)
+                finally:
+                    copy_times.append((time.perf_counter() - start) * 1000)
+
+            # Override only this scratch suite and only during the measured
+            # MERGE; the production adapter and other operations stay intact.
+            suite._copy_log = copy_log
+            try:
+                merged = measure("merge", lambda: suite.merge("main", "feature", on_conflict="ours"))
+            finally:
+                suite._copy_log = original_copy
+            merge_measurement = measurements[-1]
+            if len(copy_times) != 1:
+                raise AssertionError(("expected one log copy", copy_times))
+            merge_measurement["client_merge_timing"] = {
+                "total_ms": merge_measurement["elapsed_ms"], "log_copy_ms": copy_times[0],
+                "other_ms": merge_measurement["elapsed_ms"] - copy_times[0],
+                "log_copy_calls": len(copy_times),
+            }
+            if history_rows:
+                check_merge_history(suite, target, history_rows)
             if mode == "summary" and suite._merge_summary_supported is not True:
                 raise RuntimeError("Server does not support MERGE OUTPUT SUMMARY")
             if mode == "database" and suite._database_branch_supported["merge"] is not True:
@@ -293,7 +380,8 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None, muta
                 if tuple(map(int, actual)) != (rows, rows * (rows - 1) // 2):
                     raise AssertionError(actual)
         return {"mode": mode, "tables": table_count, "rows_per_table": rows,
-                "changed_per_table": changed, "mutation": mutation, "measurements": measurements}
+                "changed_per_table": changed, "mutation": mutation, "measurements": measurements,
+                "history_rows": history_rows, "history": history, "log_copy": log_copy}
     finally:
         if suite is not None:
             suite.close_connection()
@@ -306,14 +394,18 @@ def main():
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--changed", type=int, default=100)
     parser.add_argument("--mutation", choices=["update", "delete"], default="update")
+    parser.add_argument("--history-rows", type=int, nargs="+", default=[0],
+                        help="synthetic source log rows added before MERGE; destination shares 90%%")
+    parser.add_argument("--log-copy", nargs="+", choices=["adapter", "legacy_or"], default=["adapter"],
+                        help="log-copy SQL strategy, separate from the native MERGE interface")
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--modes", nargs="+", choices=["legacy", "summary", "database"],
                         default=["legacy", "summary", "database"])
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--server-log", type=Path, help="local INFO JSON log of an exclusive test server")
     args = parser.parse_args()
-    if min(args.tables) < 1 or args.reps < 1 or not 0 < args.changed <= args.rows:
-        parser.error("positive table/repetition counts and 0 < changed <= rows are required")
+    if min(args.tables) < 1 or args.reps < 1 or not 0 < args.changed <= args.rows or min(args.history_rows) < 0:
+        parser.error("positive table/repetition counts, 0 < changed <= rows, and nonnegative history rows are required")
     if not mo.MO_COUNT_CONFLICTS:
         parser.error("conflict reporting must be enabled for correctness checks")
     if args.server_log and not args.server_log.is_file():
@@ -322,23 +414,29 @@ def main():
         "adapter_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "adapter_dirty": bool(subprocess.check_output(
             ["git", "status", "--porcelain", "--untracked-files=no"], text=True).strip()),
+        "adapter_source_sha256": hashlib.sha256(Path(mo.__file__).read_bytes()).hexdigest(),
+        "profiler_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "endpoint": f"{mo.MO_HOST}:{mo.MO_PORT}",
         "server": server_identity(),
-        "scope": "client COM_QUERY only; excludes setup, seed, cleanup, and handshake",
+        "scope": "client COM_QUERY only; excludes setup, seed (including synthetic history), "
+                 "validation, cleanup, and handshake; client_merge_timing partitions the complete "
+                 "adapter MERGE call, with server timings nested inside its other_ms",
         "runs": [],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for count in args.tables:
-        for rep in range(args.reps):
-            # Alternate order to reduce systematic first-run cache bias.
-            modes = args.modes if rep % 2 == 0 else list(reversed(args.modes))
-            for mode in modes:
-                run = run_once(count, args.rows, args.changed, mode, server_log=args.server_log,
-                               mutation=args.mutation)
-                run["repetition"] = rep
-                report["runs"].append(run)
-                args.out.write_text(json.dumps(report, indent=2) + "\n")
-                print(mode, count, {m["operation"]: m["statements"] for m in run["measurements"]}, flush=True)
+        for history_rows in args.history_rows:
+            for rep in range(args.reps):
+                # Alternate both native interface and log-copy strategy order.
+                variants = [(mode, copy) for mode in args.modes for copy in args.log_copy]
+                for mode, copy in (variants if rep % 2 == 0 else list(reversed(variants))):
+                    run = run_once(count, args.rows, args.changed, mode, server_log=args.server_log,
+                                   mutation=args.mutation, history_rows=history_rows, log_copy=copy)
+                    run["repetition"] = rep
+                    report["runs"].append(run)
+                    args.out.write_text(json.dumps(report, indent=2) + "\n")
+                    print(mode, count, "history", history_rows, copy,
+                          {m["operation"]: m["statements"] for m in run["measurements"]}, flush=True)
 
 
 if __name__ == "__main__":
