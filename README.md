@@ -1039,14 +1039,16 @@ MO commit `5a2943202` removes insert staging from MERGE. Ordinary inserts now
 use one batched `INSERT INTO target (columns) VALUES ...` through the same
 transaction/statement executor used by staged writes. This retains RC retry
 handling and rollback, including rollback of earlier tables when a later
-table fails. UPDATE and DELETE still use their on-demand stages; PICK, portable
-SQL output, and the existing keyless/exact-float insert paths are unchanged.
+table fails. At this commit, UPDATE and DELETE retained their on-demand stages;
+later integer fast paths are described below. PICK, portable SQL output, and
+the existing keyless/exact-float insert paths are unchanged.
 
 Compared with `500f53066`, this removes three staging DDL statements per table
 that needs ordinary inserts, and reduces each insert batch from three DML
 statements (stage load, INSERT SELECT, stage clear) to one. Thus INSERT-only
-MERGE creates no stages, INSERT+UPDATE uses one, and INSERT+DELETE+UPDATE uses
-two. These are server-generated statements; client SQL counts do not change.
+MERGE creates no stages; at this commit INSERT+UPDATE used one, and
+INSERT+DELETE+UPDATE used two. These are server-generated statements; client
+SQL counts do not change.
 
 A fresh comparison on 2026-10-25 used baseline `500f53066`, direct-insert build
 `5a2943202`, and the same clean adapter `ac82249`. The workload and procedure
@@ -1143,9 +1145,9 @@ paths. PICK and portable SQL output are unchanged.
 
 For an eligible UPDATE-only merge with one batch, server-generated apply SQL
 falls from five statements (initial DROP, CREATE, stage load, UPDATE, final DROP)
-to one UPDATE. INSERT plus eligible UPDATE needs no stages; DELETE still uses
-its stage. Batches may switch between inline and staged updates within one
-merge, preserving clear-before-reuse semantics. Both paths use the same
+to one UPDATE. INSERT plus eligible UPDATE needs no stages; at this commit
+DELETE retained its stage. Batches may switch between inline and staged updates
+within one merge, preserving clear-before-reuse semantics. Both paths use the same
 transaction and retryable statement executor. Client SQL counts do not change.
 
 A comparison on 2026-10-25 used baseline `272d41114`, final build `3f54a1a83`,
@@ -1263,7 +1265,93 @@ and the 90,000-row repeated-merge tests pass. Eighteen live checks verify all
 three interfaces, data/counts, complete timings, expected probe counts, and
 absence of leaked stages.
 
-In a separate traced run of the same 10-table workload, legacy merge emitted
+MO commit `91e759ddb` applies small integer-key MERGE deletions directly with
+`DELETE FROM target WHERE key IN (...)`, including tuple matching for composite
+keys. All explicit primary-key components must be signed or unsigned integers;
+non-key columns may have other types. Each deletion batch is limited to 128
+rows and 512 key values. Larger batches, noninteger keys, and keyless tables
+retain staging; PICK and portable SQL output are unchanged.
+
+An eligible single-batch DELETE-only merge now generates one apply statement
+instead of five (initial DROP, CREATE, stage load, DELETE, final DROP). Small
+eligible INSERT/UPDATE/DELETE mixtures need no stages. Direct and staged deletes
+use the same transaction and retryable executor; a direct batch between staged
+batches preserves clear-before-reuse behavior. Client SQL counts do not change.
+
+The profiler now accepts `--mutation delete`, recorded as `mutation` in each
+run. It deletes the first `--changed` source keys and inserts one source row;
+the destination updates the first half of those keys. Under `ours`, conflicting
+deletions are skipped. The default remains `--mutation update`. Both workloads
+check conflicts and data after merge, revert, and reset, including odd change
+counts. Run against each build separately with an exclusive INFO JSON log:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_operations \
+  --tables 1 10 --rows 1000 --changed 100 --mutation delete --reps 3 \
+  --modes summary database --server-log /tmp/mo.json.log \
+  --out /tmp/mo-delete-profile.json
+```
+
+A comparison on 2026-10-25 used baseline `322c08ee1`, built server `91e759ddb`,
+and the unchanged `cc52d4a` adapter with the profiler extension above. Both
+JSON files record a dirty tracked tree because this profiler change was not
+yet committed. Each server ran three repetitions per interface/table count,
+alternating interfaces, with the baseline first. Each table had 1,000 rows,
+100 source deletions plus one insert, and 50 destination updates; SKIP applied
+50 deletions/table. Medians in ms:
+
+| Interface / tables | Client merge before → after | Server merge before → after | Stage init + cleanup before → after |
+| --- | ---: | ---: | ---: |
+| Table summary / 1 | 181 → 148 | 43 → 15 | 23 → 0 |
+| Database / 1 | 177 → 177 | 40 → 20 | 20 → 0 |
+| Table summary / 10 | 552 → 291 | 365 → 151 | 196 → 0 |
+| Database / 10 | 491 → 254 | 337 → 114 | 214 → 0 |
+
+Ten-table client medians fell about 47%/48% for table/database MERGE. One-table
+database client latency was unchanged despite lower server time. All 24 runs
+checked conflicts and merge/revert/reset data with complete server timings.
+Client merge statements remain 15 for one table and 24/15 for ten-table
+table/database modes. These are small local diagnostic samples, not throughput
+or tail-latency guarantees.
+
+A separate table-summary MERGE with ACCEPT, no destination changes, and three
+fresh database pairs per size/build checked threshold and bulk behavior:
+
+| Seeded rows | Deleted rows | Baseline client ms | Optimized client ms | Optimized staging |
+| --- | ---: | ---: | ---: | --- |
+| 256 | 128 | 43 | 13 | none |
+| 256 | 129 | 43 | 33 | retained |
+| 1,000 | 900 | 56 | 55 | retained |
+| 10,000 | 9,000 | 145 | 141 | retained |
+| 90,000 | 85,000 | 769 | 747 | retained |
+
+The 128-row case records zero staging time; 129 rows and the bulk cases retain
+staging. These samples show no bulk regression but do not establish a bulk
+speedup. To reproduce, vary the seed/delete bounds below and time only MERGE:
+
+```sql
+CREATE DATABASE delete_dst;
+CREATE TABLE delete_dst.t(id INT PRIMARY KEY, v INT);
+INSERT INTO delete_dst.t SELECT result,result FROM generate_series(1,90000) g;
+DATA BRANCH CREATE DATABASE delete_src FROM delete_dst;
+DELETE FROM delete_src.t WHERE id<=85000;
+DATA BRANCH MERGE delete_src.t INTO delete_dst.t WHEN CONFLICT ACCEPT OUTPUT SUMMARY;
+SELECT COUNT(*),SUM(v),MIN(id),MAX(id) FROM delete_dst.t;
+DROP DATABASE delete_src;
+DROP DATABASE delete_dst;
+```
+
+Regression coverage includes signed/unsigned integer boundaries, composite and
+quoted keys, nullable non-key columns, SKIP/ACCEPT, explicit rollback, repeated
+no-op merges, and rollback of an earlier direct DELETE when a later table fails.
+Lifecycle tests check row/value limits, direct batches between staged loads,
+failure/cancellation, and type/mode fallback. The Branch/hashmap/snapshot-join
+suite and existing 90,000-row stage-reuse/repeated-merge regressions pass.
+Eighteen checks against the built server cover plain, table-summary, and
+database MERGE, data/counts, complete timings, and absence of leaked stages;
+small eligible delete and mixed workloads record zero staging time.
+
+In a separate traced run of the 10-table UPDATE workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
 resolution but still did two diff passes per table.

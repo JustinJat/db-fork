@@ -15,6 +15,8 @@ passes, not individual SQL.
 Instrumented servers also report exclusive merge phase wall times. Request
 totals include table timings and transaction finish; do not add table totals
 again. Missing or incomplete timing logs are explicitly marked in the JSON.
+--mutation delete replaces source updates with deletions; both workloads insert
+one source row and update half the changed keys on the destination (conflicts).
 """
 
 import argparse
@@ -195,7 +197,9 @@ def server_identity():
         conn.close()
 
 
-def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
+def run_once(table_count, rows, changed, mode, backend=mo, server_log=None, mutation="update"):
+    if mutation not in ("update", "delete"):
+        raise ValueError(f"unsupported mutation: {mutation}")
     db = "bb_mop_" + uuid.uuid4().hex[:10]
     suite = None
     measurements = []
@@ -234,7 +238,8 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
             # This is the adapter's branch switch, not a TCP handshake.
             measure("connect", lambda: suite._connect_impl(Ref("feature")))
             check(suite.exec([sql for i in range(table_count) for sql in (
-                f"UPDATE t{i} SET v=v+1 WHERE id < {changed}",
+                (f"DELETE FROM t{i} WHERE id < {changed}" if mutation == "delete"
+                 else f"UPDATE t{i} SET v=v+1 WHERE id < {changed}"),
                 f"INSERT INTO t{i} VALUES ({rows}, {rows})",
             )], refs=["feature"])[0])
             feature = measure("commit", lambda: suite.commit("feature", "feature work"))
@@ -253,9 +258,18 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
                 raise AssertionError((merged["conflicts"], expected_conflicts))
             for i in range(table_count):
                 actual = suite._execute(f"SELECT COUNT(*), SUM(v) FROM t{i}")[0]
+                expected_count = rows + 1
                 expected_sum = rows * (rows - 1) // 2 + rows + changed + changed // 2
-                if tuple(map(int, actual)) != (rows + 1, expected_sum):
-                    raise AssertionError((actual, expected_sum))
+                if mutation == "delete":
+                    # SKIP preserves the destination's updated first half; only
+                    # the source's remaining deletions are applied.
+                    half = changed // 2
+                    deleted = changed - half
+                    expected_count -= deleted
+                    deleted_sum = (half + changed - 1) * deleted // 2
+                    expected_sum = rows * (rows - 1) // 2 + rows + 2 * half - deleted_sum
+                if tuple(map(int, actual)) != (expected_count, expected_sum):
+                    raise AssertionError((actual, expected_count, expected_sum))
             measure("revert", lambda: suite.revert("main", merged["hash"]))
             if mode == "database" and suite._database_restore_supported["revert"] is not True:
                 raise RuntimeError("Server-side database REVERT was not used")
@@ -272,7 +286,7 @@ def run_once(table_count, rows, changed, mode, backend=mo, server_log=None):
                 if tuple(map(int, actual)) != (rows, rows * (rows - 1) // 2):
                     raise AssertionError(actual)
         return {"mode": mode, "tables": table_count, "rows_per_table": rows,
-                "changed_per_table": changed, "measurements": measurements}
+                "changed_per_table": changed, "mutation": mutation, "measurements": measurements}
     finally:
         if suite is not None:
             suite.close_connection()
@@ -284,6 +298,7 @@ def main():
     parser.add_argument("--tables", type=int, nargs="+", default=[1, 10])
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--changed", type=int, default=100)
+    parser.add_argument("--mutation", choices=["update", "delete"], default="update")
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--modes", nargs="+", choices=["legacy", "summary", "database"],
                         default=["legacy", "summary", "database"])
@@ -311,7 +326,8 @@ def main():
             # Alternate order to reduce systematic first-run cache bias.
             modes = args.modes if rep % 2 == 0 else list(reversed(args.modes))
             for mode in modes:
-                run = run_once(count, args.rows, args.changed, mode, server_log=args.server_log)
+                run = run_once(count, args.rows, args.changed, mode, server_log=args.server_log,
+                               mutation=args.mutation)
                 run["repetition"] = rep
                 report["runs"].append(run)
                 args.out.write_text(json.dumps(report, indent=2) + "\n")
