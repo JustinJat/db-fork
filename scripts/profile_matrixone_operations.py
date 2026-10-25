@@ -11,11 +11,15 @@ Run against a disposable local server for comparable latency measurements.
 With --server-log, also count DataBranch events appended to a local JSON log
 at INFO level. This requires an exclusive server and no log rotation during
 the run; HashDiff events count internal diff passes, not individual SQL.
+Instrumented servers also report exclusive merge phase wall times. Request
+totals include table timings and transaction finish; do not add table totals
+again. Missing or incomplete timing logs are explicitly marked in the JSON.
 """
 
 import argparse
 from collections import Counter
 import json
+import math
 from pathlib import Path
 import subprocess
 import time
@@ -24,6 +28,55 @@ import uuid
 from dblib import matrixone as mo
 from dblib import result_collector as rc
 from dblib.db_api import Ref
+
+
+def summarize_merge_timings(records, expected_requests):
+    """Correlate table events and sum only complete request-level measurements."""
+    requests = [r for r in records if r.get("msg") == "DataBranch-Merge-Request-Timing"]
+    tables = [r for r in records if r.get("msg") == "DataBranch-Merge-Table-Timing"]
+    issues = []
+    if not requests:
+        issues.append("no request timings captured; server may lack instrumentation")
+    if len(requests) != expected_requests:
+        issues.append(f"expected {expected_requests} request timings, captured {len(requests)}")
+    ids = [r.get("request_id") for r in requests]
+    if any(not isinstance(i, str) or not i for i in ids) or len(set(map(str, ids))) != len(ids):
+        issues.append("missing or duplicate request IDs")
+
+    def duration(value):
+        return (type(value) in (int, float) and math.isfinite(value) and value >= 0)
+
+    for record in requests + tables:
+        phases = record.get("phases_ms")
+        valid = (record.get("schema_version") == 1
+                 and record.get("status") in ("ok", "error", "panic")
+                 and duration(record.get("total_ms"))
+                 and isinstance(phases, dict) and bool(phases)
+                 and all(duration(v) for v in phases.values()))
+        if not valid:
+            issues.append("invalid or unsupported timing record")
+        elif not math.isclose(sum(phases.values()), record["total_ms"], rel_tol=1e-6, abs_tol=1e-6):
+            issues.append("phase durations do not sum to total_ms")
+    for request in requests:
+        children = [t for t in tables if t.get("request_id") == request.get("request_id")]
+        if type(request.get("table_count")) is not int or request["table_count"] != len(children):
+            issues.append("incomplete table timings for a request")
+    if any(t.get("request_id") not in ids for t in tables):
+        issues.append("table timing has no completed request")
+    complete = bool(requests) and not issues
+    phases = Counter()
+    if complete:
+        for request in requests:
+            phases.update(request["phases_ms"])
+    return {
+        "available": bool(requests or tables),
+        "complete": complete,
+        "issues": list(dict.fromkeys(issues)),
+        "total_ms": sum(r["total_ms"] for r in requests) if complete else None,
+        "phases_ms": dict(phases) if complete else None,
+        "requests": requests,
+        "tables": tables,
+    }
 
 
 class SQLTrace:
@@ -94,16 +147,27 @@ class SQLTrace:
             measurement["merge_summary"] = result.value["merge_summary"]
         if self.server_log:
             events = Counter()
+            records = []
             with self.server_log.open("rb") as log:
                 log.seek(offset)
                 for line in log:
                     try:
-                        event = json.loads(line).get("msg", "")
+                        record = json.loads(line)
                     except (ValueError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    event = record.get("msg", "")
+                    if not isinstance(event, str):
                         continue
                     if event.startswith("DataBranch-"):
                         events[event] += 1
+                        records.append(record)
             measurement["server_events"] = dict(events)
+            if operation == "merge":
+                expected = sum(r["error"] is None and r["sql"].lstrip().upper().startswith("DATA BRANCH MERGE ")
+                               for r in self.records)
+                measurement["server_merge_timing"] = summarize_merge_timings(records, expected)
             if operation in ("diff", "merge") and not events["DataBranch-HashDiff-Done"]:
                 raise RuntimeError("No HashDiff events captured; use an exclusive server with INFO JSON logging")
         return result, measurement

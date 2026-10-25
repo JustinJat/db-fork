@@ -928,6 +928,56 @@ test server configured for INFO JSON logging. The report counts appended
 `DataBranch-*` events, including `DataBranch-HashDiff-Done`; these measure
 internal diff passes, not total engine SQL statements. Log rotation and
 other clients make this attribution invalid.
+
+With the local merge timing change (`026daa338` on
+[`branchbench-opt`](https://github.com/zuyu/matrixone/tree/branchbench-opt)), the
+same `--server-log` option adds `server_merge_timing` to each merge measurement:
+`total_ms`, `phases_ms`, and raw `requests`/`tables` correlated by `request_id`.
+The server emits `DataBranch-Merge-Request-Timing` and
+`DataBranch-Merge-Table-Timing` at INFO level, with numeric milliseconds and
+`schema_version: 1`. Both plain MERGE and MERGE OUTPUT SUMMARY are covered,
+including database-level MERGE. No SQL result columns change.
+
+| Phase | Work included |
+| --- | --- |
+| `executor_acquire` | Acquire the mutation executor/transaction and lineage-owner lifecycle admission |
+| `enumerate` | Database table enumeration and selection |
+| `authorize` | Database-wide table authorization before writes |
+| `relations` | Resolve table endpoints and relation metadata |
+| `prepare_worker` | Prepare the table worker |
+| `lineage` | Resolve branch ancestry and the common ancestor |
+| `reconcile_schema` | Reconcile endpoint schemas in the engine |
+| `diff` | Traverse changes and calculate summaries, excluding synchronous apply callbacks |
+| `stage_init` | Create staging tables, including their initial DROP IF EXISTS |
+| `apply` | Encode batches, load stages, execute target DML, clear stage rows, and flush remaining buffers |
+| `stage_cleanup` | Drop staging tables after apply |
+| `summary_output` | Prepare/save the summary result |
+| `txn_finish` | Finish the owned transaction or explicit transaction's statement |
+| `other` | Remaining handler work, resource cleanup, and timing/logging overhead |
+
+These are exclusive **wall times**, not CPU times; internal SQL retries and
+waits stay in the phase that performs them. Request phases include all child
+table phases. The profiler aggregates **only request events**, so ten table
+requests and one database request with ten table events are both counted
+correctly. Phase values sum to the handler's `total_ms`; SQL parsing, outer
+protocol work, client network time, and adapter catalog/schema/log queries
+remain outside that total and are visible in the existing client query trace.
+
+Request `status` is `ok`, `error`, or `panic`, recorded after transaction finish;
+a table can succeed before a later table or transaction commit fails. The
+`finish_action` records the attempted `commit`/`rollback`, `statement` for an
+explicit transaction, or `not_acquired` if executor acquisition did not finish.
+For an explicit transaction, a later user COMMIT/ROLLBACK is excluded. A no-op
+summary merge reports zero stage/apply times. The adapter's legacy path still
+performs extra DIFF queries outside the server MERGE timings.
+
+Older servers produce `available: false`, `complete: false`, and null totals.
+Missing request/table events, duplicate IDs, unsupported timing versions, or
+inconsistent phase sums also produce `complete: false`, with `issues` and raw
+records retained; partial timings are never presented as a complete total.
+Without `--server-log`, no server timing field is added. This instrumentation
+does not itself claim a merge performance improvement.
+
 In a separate traced run of the same 10-table workload, legacy merge emitted
 40 `HashDiff-Done` and 40 `GetRelations-Done` events; the initial native summary
 implementation (`8fae23f97`) emitted 20 and 10 respectively. It shared relation
