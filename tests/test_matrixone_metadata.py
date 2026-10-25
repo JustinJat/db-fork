@@ -10,7 +10,9 @@ from dblib.db_api import Ref
 
 
 def suite():
-    return object.__new__(mo.MatrixOneToolSuite)
+    s = object.__new__(mo.MatrixOneToolSuite)
+    s._merge_summary_supported = False
+    return s
 
 
 def test_catalog_preserves_pk_order_and_column_defaults():
@@ -52,10 +54,12 @@ def test_schema_conflict_is_detected_before_any_ddl():
 
 
 @pytest.mark.parametrize("table_count", [1, 12])
-def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypatch, table_count):
+@pytest.mark.parametrize("native_summary", [False, True])
+def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypatch, table_count, native_summary):
     monkeypatch.setattr(mo, "MO_NATIVE_MERGE_AS_IS", False)
     monkeypatch.setattr(mo, "MO_COUNT_CONFLICTS", True)
     s = suite()
+    s._merge_summary_supported = native_summary
     queries = []
     version = [0]
 
@@ -70,6 +74,8 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
             return [(f"t{i}", *col) for i in range(table_count) for col in cols]
         if sql.startswith("SHOW CREATE TABLE"):
             return [("t", "CREATE TABLE `t` (`id` int, `v` int, `extra` int DEFAULT 7)")]
+        if sql.endswith("OUTPUT SUMMARY"):
+            return [(1, 0, 0, 1, 0, 0, 1)]
         if sql.startswith(("SHOW", "SELECT")):
             raise AssertionError(f"unexpected per-table metadata query: {sql}")
         return None
@@ -95,6 +101,10 @@ def test_merge_catalog_queries_are_constant_and_refreshed_between_calls(monkeypa
     assert len(catalog_queries) == 4  # exactly two per operation, at either scale
     assert sum(sql.startswith("ALTER TABLE") for sql, _ in queries) == table_count
     assert sum(sql.startswith("DATA BRANCH MERGE") for sql, _ in queries) == 2 * table_count
+    if native_summary:
+        s._summary.assert_not_called()
+    else:
+        assert s._summary.call_count == 2 * table_count
 
 
 def test_commit_index_migration_handles_concurrent_initialization():

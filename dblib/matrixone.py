@@ -34,9 +34,10 @@ report uses):
     log        SELECT FROM _bb_commits
     diff       DATA BRANCH DIFF ... OUTPUT SUMMARY per table
     merge      DATA BRANCH MERGE <src>.<t> INTO <dst>.<t> WHEN CONFLICT
-               SKIP|ACCEPT per table ("ours" | "theirs"); the conflict
-               count and the rows handed to a resolve callable come from
-               two native diffs against the fork snapshot joined in SQL
+               SKIP|ACCEPT OUTPUT SUMMARY per table ("ours" | "theirs");
+               older servers and custom resolvers use a pre-merge summary
+               and two native diffs against the fork snapshot, with
+               conflict rows joined in Python
     rebase     re-fork: the branch's next generation is cloned from the
                upstream's head snapshot and snapshotted at once (the new
                base), then receives the branch's delta since its previous
@@ -111,9 +112,12 @@ MO_HOST = os.environ.get("MO_HOST") or os.environ.get("DBFORK_SERVER_HOST", "127
 MO_PORT = int(os.environ.get("MO_PORT", "6001"))
 MO_DATA_DIR = os.path.expanduser(os.environ.get("MO_DATA_DIR", "~/mo/matrixone/mo-data"))
 
-# Count conflicts (two native diffs + a join per table both sides changed)
-# even when on_conflict is "ours"/"theirs" and the count is only reported.
+# Report conflicts for "ours"/"theirs". On older servers this requires two
+# native diffs and a Python join per table both sides changed.
 MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("0", "false", "no")
+# Set to 0 for a controlled comparison with the legacy multi-statement path.
+# Unsupported servers are detected once per connection by a parser error.
+MO_MERGE_SUMMARY = os.environ.get("MO_MERGE_SUMMARY", "1").lower() not in ("0", "false", "no")
 
 # Native-only mode (DBFORK_NATIVE_ONLY=1) resets with the engine's own
 # RESTORE DATABASE as it is (it gives the restored tables new identities
@@ -410,6 +414,7 @@ class MatrixOneToolSuite(DBToolSuite):
         self._current_db = None
         self._temp_dbs: dict = {}
         self._warned = set()
+        self._merge_summary_supported = None if MO_MERGE_SUMMARY else False
         self._meta_db = meta_db_name(db_name)
         self._ensure_registry()
         self._ensure_meta(self._db_for(default_branch_name))
@@ -1129,12 +1134,38 @@ class MatrixOneToolSuite(DBToolSuite):
 
     # -- merge --------------------------------------------------------------
 
+    def _merge_with_summary(self, source: str, target: str, policy: str):
+        """Merge and return native pre-merge counts, or None if unsupported.
+
+        Only a syntax rejection at OUTPUT can select the legacy path.
+        A transport/apply/result error may follow a committed mutation and
+        must propagate without replaying the operation.
+        """
+        if self._merge_summary_supported is False:
+            return None
+        try:
+            result = self._execute(f"DATA BRANCH MERGE {source} INTO {target} "
+                                   f"WHEN CONFLICT {policy} OUTPUT SUMMARY")
+        except pymysql.MySQLError as exc:
+            if (self._merge_summary_supported is None and exc.args and exc.args[0] == 1064
+                    and re.search(r'syntax error at .*near [\'"]\s*output\b', str(exc), re.I)):
+                self._merge_summary_supported = False
+                return None
+            raise
+        if not result or len(result) != 1 or len(result[0]) != 7:
+            raise RuntimeError("Invalid MatrixOne MERGE OUTPUT SUMMARY result; merge was not retried")
+        counts = tuple(int(n) for n in result[0])
+        if any(n < 0 for n in counts):
+            raise RuntimeError("Negative MatrixOne merge counts; merge was not retried")
+        self._merge_summary_supported = True
+        return counts[:3], counts[3:6], counts[6]
+
     def _merge_impl(self, into: Ref, source: Ref, message: str, on_conflict="ours") -> dict:
         """DATA BRANCH MERGE per table. One side is always a clone of the
         other here (the LCA MatrixOne finds is the base recorded in the
         clone's fork/rebase row), so its three-way result matches ours;
-        conflicts are counted (and handed to a callable) from the two
-        sides' deltas against that base."""
+        counts come from MERGE OUTPUT SUMMARY where supported. A callable
+        or older server uses both sides' deltas against that base."""
         ours_db = self._on(into)
         theirs = self._state(source)
         if theirs.db == ours_db:
@@ -1162,6 +1193,20 @@ class MatrixOneToolSuite(DBToolSuite):
         try:
             for table in sorted(ours_catalog.keys() & theirs_catalog.keys()):
                 if table in schema["added_tables"] or not self._readable(theirs, table):
+                    continue
+                # Native summaries keep conflict rows on the server. A
+                # custom resolver still needs the legacy row-level path.
+                summary = None if want_rows else self._merge_with_summary(
+                    theirs.expr(table), _qt(ours_db, table), policy)
+                if summary is not None:
+                    source_counts, target_counts, n_conf = summary
+                    info["ours_changes"] += sum(target_counts)
+                    info["theirs_changes"] += sum(source_counts)
+                    if sum(source_counts):
+                        info["merged_tables"].append(table)
+                    if n_conf and rel is not None and MO_COUNT_CONFLICTS:
+                        info["conflicts"] += n_conf
+                        info["conflict_tables"].append(table)
                     continue
                 (ti, td, tu), (oi, od, ou) = self._summary(theirs.expr(table), _qt(ours_db, table))
                 info["ours_changes"] += oi + od + ou

@@ -773,14 +773,30 @@ same summary for the report):
   `log()` (simulated) reads the table.
 - `diff()` (native): `DATA BRANCH DIFF ... OUTPUT SUMMARY` per table.
 - `merge()` (composed): `DATA BRANCH MERGE <src>.<t> INTO <dst>.<t> WHEN
-  CONFLICT SKIP|ACCEPT` per table ("ours" | "theirs"); the conflict count,
-  and the rows a resolve callable gets (Dolt's `base_*`/`our_*`/`their_*`
-  shape), come from the two sides' native diffs against the fork snapshot.
+  CONFLICT SKIP|ACCEPT OUTPUT SUMMARY` per table ("ours" | "theirs") on
+  servers supporting this extension. The single result row contains
+  `source_inserted`, `source_deleted`, `source_updated`,
+  `destination_inserted`, `destination_deleted`, `destination_updated`,
+  and `conflicts`. These are logical differences **before** the merge,
+  independent of the conflict policy; equal changes are excluded.
+  Older servers and custom resolvers use a separate summary and both sides'
+  native diffs against the fork snapshot. A resolver receives Dolt's
+  `base_*`/`our_*`/`their_*` row shape.
   A callable runs over the SKIP result. Tables and columns the source has
   and the target lacks are added first (`DATA BRANCH CREATE TABLE ... FROM`,
   `ALTER TABLE ADD COLUMN`); a differing primary key is a schema conflict
   and the verb fails without touching data. Set `MO_COUNT_CONFLICTS=0` to
-  skip the conflict count when `on_conflict` is "ours"/"theirs".
+  omit conflict reporting when `on_conflict` is "ours"/"theirs" (this also
+  avoids fetching conflict rows on the legacy path). `MO_MERGE_SUMMARY=0`
+  selects the legacy path for comparison. Automatic fallback occurs once
+  per connection, only after a parser rejection at `OUTPUT`; execution and
+  transport errors are never retried as a legacy merge.
+  The initial server implementation shares endpoint/lineage resolution
+  but traverses differences twice: once for statistics, once for apply.
+  It retains changed primary keys during statistics, requiring memory
+  proportional to the changed keys. Fewer client statements do not imply
+  a single engine pass. Database-wide atomic merge is not provided by this
+  per-table interface.
 - `rebase()` (composed): a re-fork. A temporary clone of the upstream's
   head snapshot receives the branch's delta since its fork point through
   `DATA BRANCH PICK ... BETWEEN SNAPSHOT` (the branch's own snapshots;
