@@ -43,7 +43,7 @@ def events(request_id="r", tables=2, status="ok"):
 
 def restore_event(operation="reset"):
     return {"msg": "DataBranch-Restore-Work", "schema_version": 1, "request_id": "r",
-            "operation": operation, "status": "ok", "table_count": 1,
+            "operation": operation, "status": "ok", "staging": "temporary", "table_count": 1,
             "sql_statements": 3, "sql_counts": {"stage_create": 2, "delete": 0, "update": 0,
                                                "insert": 0, "stage_drop": 1},
             "empty_stages": 2, "unknown_stages": 0, "materialized_rows": 0, "total_ms": 6,
@@ -63,6 +63,7 @@ def test_restore_work_keeps_status_and_counts_once(operation, status):
     assert sum(result["sql_counts"].values()) == 6
     assert sum(result["phases_ms"].values()) == 12
     assert result["records"][0]["status"] == status
+    assert result["records"][0]["staging"] == "temporary"
 
 
 @pytest.mark.parametrize("change", [
@@ -91,6 +92,14 @@ def test_old_restore_server_does_not_report_zero_work():
     result = summarize_restore_work([], 1, "reset")
     assert not result["available"] and not result["complete"]
     assert result["sql_statements"] is None
+
+
+def test_restore_work_without_staging_label_keeps_counts_without_guessing_path():
+    record = restore_event()
+    record.pop("staging")
+    result = summarize_restore_work([record], 1, "reset")
+    assert result["complete"] and result["sql_statements"] == 3
+    assert "staging" not in result["records"][0]
 
 
 @pytest.mark.parametrize("operation", ["reset", "revert"])

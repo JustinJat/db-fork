@@ -152,8 +152,12 @@ def main():
                 report["runs"].append(run)
                 args.out.write_text(json.dumps(report, indent=2) + "\n")
                 m = run["measurement"]
-                print(tables, operation, mutation, "sql", m["server_restore_work"]["sql_statements"],
-                      "ms", round(m["elapsed_ms"], 2), flush=True)
+                work = m["server_restore_work"]
+                print(tables, operation, mutation,
+                      "staging", work["records"][0].get("staging", "unreported"),
+                      "sql", work["sql_statements"], "ms", round(m["elapsed_ms"], 2),
+                      "create_ms", round(work["phases_ms"]["stage_create"], 2),
+                      "drop_ms", round(work["phases_ms"]["stage_drop"], 2), flush=True)
 
 
 if __name__ == "__main__":

@@ -1893,6 +1893,71 @@ adapter/profile/live tests passed on the built server. Complete 1/10-table
 adapter workflows also passed and captured one catalog record per native
 restore, with no repeated relation-pair resolution and unchanged client counts.
 
+MO commit `5a1dfa610` targets the expensive staging cleanup statement itself.
+RESET/REVERT now use `CREATE TEMPORARY TABLE ... AS SELECT` and bounded
+`DROP TEMPORARY TABLE` batches through the background executor. This keeps
+stages in the restore's owner transaction and avoids ordinary-table work such
+as publication/view invalidation and role-privilege cleanup. Physical cleanup
+is synchronous; it is not deferred to session close or background GC. The
+existing temporary-alias journal follows transaction/statement rollback.
+
+A fresh comparison against `4efa5a736` used the same 1/10-table, 1,000-row,
+100-changed-row workloads and three repetitions per scenario, with INFO logging
+on the exclusive local port 16001. All 120 native calls passed row, identity,
+stage-count and cleanup checks. For ten tables, `stage_drop` is one statement
+dropping 20 staging tables; its measured duration is therefore the latency of
+that single background SQL call, including parsing, planning and execution.
+
+| Changes undone, 10 tables | RESET DROP before/after (ms) | REVERT DROP before/after (ms) | RESET request before/after (ms) | REVERT request before/after (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| No changes | 248 / 50 | 162 / 48 | 342 / 183 | 280 / 184 |
+| Insert only | 184 / 50 | 154 / 68 | 292 / 178 | 295 / 170 |
+| Delete only | 156 / 46 | 149 / 53 | 275 / 152 | 322 / 192 |
+| Update only | 153 / 74 | 192 / 66 | 331 / 310 | 435 / 286 |
+| Mixed | 184 / 46 | 183 / 49 | 442 / 287 | 496 / 280 |
+
+These are medians. The ten-table cleanup statement improved by 2.05–4.93x;
+complete native requests improved by 1.07–1.87x. Restore-owned SQL counts and
+client request counts did not change. Stage creation still matters: update-only
+RESET's CTAS phase rose from 74 to 112 ms in this sample, offsetting part of
+the cleanup gain. One-table delete-only RESET did not improve overall (31 / 36
+ms), despite faster cleanup. Versions ran in separate blocks, alternating
+operation/case order across repetitions; this is not a throughput or tail-latency
+result.
+
+The complete adapter workflow was also measured against the same two builds
+with `python -m scripts.profile_matrixone_operations --tables 1 10 --rows 1000 --changed
+100 --reps 3 --modes database`, including adapter metadata and commit
+bookkeeping. Here the optimized build ran first, then the baseline, each on
+port 16001 with `--server-log` and `--out` supplied. All twelve workflows passed
+their result checks and captured complete restore work records.
+
+| Tables | Operation | Before median (ms) | After median (ms) | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | RESET | 82.2 | 84.6 | 0.97x |
+| 1 | REVERT | 127.2 | 147.4 | 0.86x |
+| 10 | RESET | 405.8 | 308.6 | 1.31x |
+| 10 | REVERT | 519.9 | 391.9 | 1.33x |
+
+Ten-table adapter latency fell by about 24%; single-table adapter latency did
+not improve in this sample, even though its cleanup phase fell from about
+21–23 ms to 5 ms. Client SQL counts remain seven for RESET and eleven for
+REVERT. These three-repetition medians do not establish a general single-table
+benefit or stable latency distribution.
+
+Work records now include `staging: "temporary"`. The restore profiler prints
+the staging path, `create_ms`, and `drop_ms` alongside total request latency.
+Older work records retain their counts and are labeled `unreported` in console
+output rather than having a staging path inferred. JSON still records the
+server's exact `git_version()` and all phase timings.
+
+Go branch/snapshot/temporary-table regressions and 155 Python adapter/profile/
+live tests passed. New integration checks cover explicit COMMIT/ROLLBACK,
+repeated late failures followed by successful restores on the same connection,
+preservation of user-created temporary tables, dotted database names, and an
+uncommitted destination database. They check that physical staging tables are
+gone before transaction finish, including their generated temporary prefixes.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
