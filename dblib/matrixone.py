@@ -122,6 +122,10 @@ MO_COUNT_CONFLICTS = os.environ.get("MO_COUNT_CONFLICTS", "1").lower() not in ("
 MO_MERGE_SUMMARY = os.environ.get("MO_MERGE_SUMMARY", "1").lower() not in ("0", "false", "no")
 MO_DATABASE_BRANCH = os.environ.get("MO_DATABASE_BRANCH", "1").lower() not in ("0", "false", "no")
 MO_DATABASE_RESTORE = os.environ.get("MO_DATABASE_RESTORE", "1").lower() not in ("0", "false", "no")
+# Key-less tables (rebase replay, legacy reset/revert): delete identical rows
+# in batches instead of one DELETE ... LIMIT 1 (a full scan) per diff row.
+# Set to 0 for a controlled comparison with the row-by-row path.
+MO_NOPK_BATCH_DELETE = os.environ.get("MO_NOPK_BATCH_DELETE", "1").lower() not in ("0", "false", "no")
 
 # Native-only mode (DBFORK_NATIVE_ONLY=1) uses the server's data-only RESET
 # without client schema reconciliation. Older servers fall back to their
@@ -1209,9 +1213,23 @@ class MatrixOneToolSuite(DBToolSuite):
                 dst, cols, pk,
                 f"SELECT {self._cols('s', cols)} FROM {src_expr} s WHERE {self._in_keys(pk, chunk)}"))
 
+    # Distinct rows per batched key-less delete (see _apply_nopk_delta).
+    _NOPK_CHUNK = 200
+
     def _apply_nopk_delta(self, dst: str, cols: list, diff) -> int:
         """Apply a key-less table's diff rows to dst: INSERT rows are
-        inserted, DELETE rows delete one matching row each."""
+        inserted, DELETE rows delete one matching row each.
+
+        A key-less row can only be named by all its values (NULL-safe
+        ``<=>``) and identical copies are interchangeable, so dst loses
+        min(copies, deletes) of each distinct row. With MO_NOPK_BATCH_DELETE
+        (the default) that takes about two statements, one scan of dst
+        each, per chunk of distinct rows: a SELECT counts each row's copies
+        in dst (compared by the server, so the diff's values need not equal
+        the table's in Python), one DELETE removes the rows whose copies all
+        go, and only a row with more copies than deletes gets its own
+        DELETE ... LIMIT k. MO_NOPK_BATCH_DELETE=0, or a value Python cannot
+        hash, keeps one DELETE ... LIMIT 1 (a full scan) per diff row."""
         dcols, rows = diff
         pos = [dcols.index(c) for c in cols]
         n = 0
@@ -1222,13 +1240,36 @@ class MatrixOneToolSuite(DBToolSuite):
                     f"INSERT INTO {dst} ({', '.join(map(_quote, cols))}) "
                     f"VALUES ({', '.join(['%s'] * len(cols))})", chunk)
             n += len(inserts)
-            for flag, vals in rows:
-                if flag != "DELETE":
-                    continue
-                where = " AND ".join(f"{_quote(c)} <=> %s" for c in cols)
-                cur.execute(f"DELETE FROM {dst} WHERE {where} LIMIT 1",
-                            tuple(vals[i] for i in pos))
-                n += 1
+            deletes = [tuple(vals[i] for i in pos) for flag, vals in rows if flag == "DELETE"]
+            n += len(deletes)
+            match = "(" + " AND ".join(f"{_quote(c)} <=> %s" for c in cols) + ")"
+            counts = None
+            if MO_NOPK_BATCH_DELETE and deletes:
+                counts = {}
+                try:
+                    for vals in deletes:
+                        counts[vals] = counts.get(vals, 0) + 1
+                except TypeError:  # a value Python cannot hash: row by row
+                    counts = None
+            if counts is None:
+                for vals in deletes:
+                    cur.execute(f"DELETE FROM {dst} WHERE {match} LIMIT 1", vals)
+                return n
+            items = list(counts.items())
+            count_one = f"COUNT(CASE WHEN {match} THEN 1 END)"
+            for i in range(0, len(items), self._NOPK_CHUNK):
+                chunk = items[i:i + self._NOPK_CHUNK]
+                args = [v for vals, _ in chunk for v in vals]
+                cur.execute(f"SELECT {', '.join([count_one] * len(chunk))} FROM {dst} "
+                            f"WHERE {' OR '.join([match] * len(chunk))}", args + args)
+                have = cur.fetchone()
+                gone = [vals for (vals, k), h in zip(chunk, have) if 0 < h <= k]
+                if gone:
+                    cur.execute(f"DELETE FROM {dst} WHERE {' OR '.join([match] * len(gone))}",
+                                [v for vals in gone for v in vals])
+                for (vals, k), h in zip(chunk, have):
+                    if h > k:
+                        cur.execute(f"DELETE FROM {dst} WHERE {match} LIMIT {k}", vals)
         return n
 
     def _common_cols(self, db_a: str, db_b: str, table: str) -> list:
