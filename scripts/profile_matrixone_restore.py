@@ -90,6 +90,14 @@ def run_once(tables, rows, changed, operation, mutation, server_log):
         record, = work["records"]
         expected_rows = changed * tables * (3 if mutation == "mixed" else 0 if mutation == "noop" else 1)
         expected_empty = tables * (2 if mutation == "noop" else 0 if mutation == "mixed" else 1)
+        if record["schema_version"] == 3:
+            # This fixture has no foreign keys, so only row deltas are staged;
+            # delete deltas stay inside DELETE's subquery and are not counted
+            # as materialized rows or empty stages.
+            expected_rows = changed * tables * (2 if mutation == "mixed" else int(mutation in ("delete", "update")))
+            expected_empty = tables * int(mutation in ("noop", "insert"))
+            if record["subquery_delete_tables"] != tables or record["staged_delete_tables"] != 0:
+                raise AssertionError(f"unexpected restore delete path: {record}")
         if (record["unknown_stages"] != 0 or record["materialized_rows"] != expected_rows
                 or record["empty_stages"] != expected_empty or record["table_count"] != tables
                 or record["status"] != "ok" or measurement["statements"] != 1):
@@ -153,13 +161,15 @@ def main():
                 args.out.write_text(json.dumps(report, indent=2) + "\n")
                 m = run["measurement"]
                 work = m["server_restore_work"]
+                paths = {k: work["records"][0][k] for k in (
+                    "inline_delete_tables", "fallback_delete_tables", "subquery_delete_tables", "staged_delete_tables"
+                ) if k in work["records"][0]}
                 print(tables, operation, mutation,
                       "staging", work["records"][0].get("staging", "unreported"),
                       "sql", work["sql_statements"], "ms", round(m["elapsed_ms"], 2),
                       "create_ms", round(work["phases_ms"]["stage_create"], 2),
                       "probe_ms", round(work["phases_ms"].get("delete_probe", 0), 2),
-                      "inline_deletes", work["records"][0].get("inline_delete_tables", "unreported"),
-                      "fallback_deletes", work["records"][0].get("fallback_delete_tables", "unreported"),
+                      "delete_paths", paths or "unreported",
                       "drop_ms", round(work["phases_ms"]["stage_drop"], 2), flush=True)
 
 

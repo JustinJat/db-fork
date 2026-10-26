@@ -114,7 +114,7 @@ def summarize_restore_work(records, expected_requests, operation):
         version = record.get("schema_version")
         keys = base_keys | ({"delete_probe"} if version == 2 else set())
         counts, phases = record.get("sql_counts"), record.get("phases_ms")
-        valid = (version in (1, 2) and record.get("operation") == operation
+        valid = (version in (1, 2, 3) and record.get("operation") == operation
                  and record.get("status") in ("ok", "error", "panic")
                  and all(integer(record.get(k)) for k in ("table_count", "sql_statements", "empty_stages",
                                                           "unknown_stages", "materialized_rows"))
@@ -124,6 +124,8 @@ def summarize_restore_work(records, expected_requests, operation):
                  and all(duration(v) for v in phases.values()) and duration(record.get("total_ms")))
         if version == 2:
             valid = valid and all(integer(record.get(k)) for k in ("inline_delete_tables", "fallback_delete_tables"))
+        elif version == 3:
+            valid = valid and all(integer(record.get(k)) for k in ("subquery_delete_tables", "staged_delete_tables"))
         if not valid:
             issues.append("invalid or unsupported restore work record")
             continue
@@ -135,6 +137,11 @@ def summarize_restore_work(records, expected_requests, operation):
             if (completed_probes > counts["delete_probe"] or completed_probes > record["table_count"]
                     or (record["status"] == "ok" and completed_probes != counts["delete_probe"])):
                 issues.append("restore delete probes do not match completed paths")
+        elif version == 3:
+            subquery, staged = record["subquery_delete_tables"], record["staged_delete_tables"]
+            if (subquery > counts["delete"] or staged > counts["stage_create"]
+                    or subquery + staged > record["table_count"]):
+                issues.append("restore subquery/staged delete paths exceed work counts")
         if record["empty_stages"] + record["unknown_stages"] > counts["stage_create"] + inline:
             issues.append("restore stage counts exceed materialization attempts")
         if not math.isclose(sum(phases.values()), record["total_ms"], rel_tol=1e-6, abs_tol=1e-6):

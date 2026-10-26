@@ -124,7 +124,7 @@ def test_restore_probe_paths_keep_counts_and_timings(fallback):
 
 
 @pytest.mark.parametrize("change", [
-    lambda r: r.update(schema_version=3),
+    lambda r: r.update(schema_version=4),
     lambda r: r.pop("inline_delete_tables"),
     lambda r: r.update(fallback_delete_tables=-1),
     lambda r: r.update(inline_delete_tables=2),
@@ -145,6 +145,46 @@ def test_failed_restore_probe_can_have_no_completed_path():
     record.update(status="error", inline_delete_tables=0, empty_stages=1)
     result = summarize_restore_work([record], 1, "reset")
     assert result["complete"] and result["sql_counts"]["delete_probe"] == 1
+
+
+def restore_subquery_event():
+    record = restore_event()
+    record.update(schema_version=3, subquery_delete_tables=1, staged_delete_tables=0, empty_stages=1)
+    record["sql_counts"].update(stage_create=1, delete=1)
+    record["phases_ms"].update(stage_create=2, delete=1)
+    return record
+
+
+@pytest.mark.parametrize("path", ["subquery", "staged", "partial"])
+def test_restore_subquery_and_staged_paths(path):
+    record = restore_subquery_event()
+    if path == "staged":
+        record.update(subquery_delete_tables=0, staged_delete_tables=1, empty_stages=2)
+        record["sql_counts"].update(stage_create=2, delete=0)
+    elif path == "partial":
+        record.update(subquery_delete_tables=0, status="error", sql_statements=2)
+        record["sql_counts"]["delete"] = 0
+    result = summarize_restore_work([record], 1, "reset")
+    assert result["complete"] and not result["issues"]
+    assert "delete_probe" not in result["sql_counts"]
+    assert result["records"][0]["subquery_delete_tables"] == int(path == "subquery")
+
+
+@pytest.mark.parametrize("change", [
+    lambda r: r.pop("subquery_delete_tables"),
+    lambda r: r.update(subquery_delete_tables=2),
+    lambda r: r.update(staged_delete_tables=-1),
+    lambda r: r.update(staged_delete_tables=1),
+    lambda r: r.update(empty_stages=2),
+    lambda r: r["sql_counts"].update(delete_probe=1),
+    lambda r: r["phases_ms"].update(delete_probe=0),
+])
+def test_invalid_restore_subquery_records_do_not_publish_totals(change):
+    record = restore_subquery_event()
+    change(record)
+    result = summarize_restore_work([record], 1, "reset")
+    assert not result["complete"] and result["issues"]
+    assert result["sql_statements"] is None
 
 
 @pytest.mark.parametrize("operation", ["reset", "revert"])

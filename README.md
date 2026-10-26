@@ -1958,7 +1958,9 @@ preservation of user-created temporary tables, dotted database names, and an
 uncommitted destination database. They check that physical staging tables are
 gone before transaction finish, including their generated temporary prefixes.
 
-MO commit `99c014307` removes delete staging tables for bounded integer-key
+MO commit `99c014307` introduced an intermediate bounded-key path, superseded
+by the direct subqueries in `3a3aba8fe` described below. At `99c014307`,
+delete staging tables were removed for bounded integer-key
 deltas in RESET/REVERT. A server-side SELECT probes one row beyond the smaller
 of 128 rows and 512 key cells per table. If the delta fits, the server retains
 the exact signed/unsigned integer literals and applies `DELETE ... WHERE key
@@ -2039,6 +2041,90 @@ table regressions and 165 Python adapter/profile/live tests passed. New tests
 cover empty pipelines, signed/unsigned integer extremes, composite keys,
 128/129-row and 512-cell boundaries, overflow fallback, cancellation, failure
 cleanup, and explicit transaction rollback while preserving relation IDs.
+
+MO commit `3a3aba8fe` replaces restore's bounded `IN (...)` key lists with
+`DELETE ... JOIN (SELECT ...)`, keeping the delta query inside the SQL plan:
+
+```sql
+DELETE d FROM target.t d
+JOIN (
+    SELECT a.id
+    FROM source.t{snapshot='after'} a
+    LEFT JOIN source.t{snapshot='before'} b ON a.id = b.id
+    WHERE b.id IS NULL
+) s ON d.id = s.id;
+```
+
+The example is REVERT's delete delta; generated SQL uses the resolved snapshot
+timestamps. RESET compares the current destination with the historical source
+in the same derived-table form. This removes the separate probe, integer-only
+restriction, literal serialization, 128-row/512-cell threshold, and overflow
+CTAS replay. The derived-table boundary is supported by the existing DELETE
+planner, including reads of the target's current and historical versions.
+
+All row deltas are still staged before any target write. For RESET tables
+with foreign keys or referencing child tables, delete keys are staged too,
+preserving their pre-write set across earlier cascades. REVERT delete queries
+read immutable snapshots and can use the subquery even with foreign keys.
+Keyless RESET continues to replace contents while retaining table identity.
+The transaction owner, rollback, and synchronous stage cleanup are unchanged.
+
+Restore work logs now use schema version 3. `subquery_delete_tables` counts
+issued subquery DELETEs; `staged_delete_tables` counts successfully created
+delete stages. The separate `delete_probe` phase is gone; subquery execution
+is included in `delete`. `empty_stages` and `materialized_rows` describe actual
+temporary stages, excluding delete rows read inside the subquery. Profile
+validation handles this distinction and continues to accept versions 1 and 2.
+
+A fresh comparison against `99c014307` used the same native restore and full
+adapter commands, with INFO logging on exclusive port 16001, 1,000 rows per
+table and three repetitions. All 180 native calls and twelve adapter workflows
+passed their correctness checks. Every primary-key table in these fixtures
+used the subquery path, including the 300-row cases that previously overflowed.
+
+| Changes undone, 10 tables, 100 changed rows | RESET before/after (ms) | REVERT before/after (ms) | Internal SQL before/after |
+| --- | ---: | ---: | ---: |
+| No changes | 114.1 / 99.8 | 123.9 / 123.0 | 21 / 21 |
+| Insert only | 142.5 / 139.1 | 146.6 / 131.6 | 31 / 21 |
+| Delete only | 100.3 / 134.4 | 141.0 / 181.1 | 41 / 41 |
+| Update only | 222.5 / 254.3 | 238.9 / 206.6 | 41 / 41 |
+| Mixed | 265.1 / 255.6 | 230.8 / 232.3 | 51 / 41 |
+
+| Changes undone, 10 tables, 300 changed rows | RESET before/after (ms) | REVERT before/after (ms) | Internal SQL before/after |
+| --- | ---: | ---: | ---: |
+| No changes | 112.3 / 144.3 | 98.6 / 155.2 | 21 / 21 |
+| Insert only | 168.3 / 148.8 | 216.0 / 133.0 | 41 / 21 |
+| Delete only | 149.2 / 152.8 | 130.0 / 132.3 | 41 / 41 |
+| Update only | 272.0 / 357.0 | 312.1 / 351.4 | 41 / 41 |
+| Mixed | 524.1 / 499.0 | 573.8 / 542.4 | 61 / 41 |
+
+Internal SQL counts include stage/apply/cleanup calls, excluding nested CTAS
+INSERTs and catalog/transaction SQL; each native operation still uses one
+client request. For 300-row insert-only REVERT, CTAS time fell from 111.6 to
+51.9 ms and cleanup from 47.1 to 24.8 ms; the former 8.8 ms probe disappeared,
+while DELETE itself rose from 9.1 to 13.9 ms. Unlike the previous probe path,
+an empty delete delta still executes a DELETE plan. Eliminating probes and
+literal lists therefore does not guarantee lower latency for empty/small deltas.
+
+| Full adapter workflow | Before median (ms) | After median (ms) |
+| --- | ---: | ---: |
+| 1 table RESET | 58.0 | 74.1 |
+| 1 table REVERT | 121.9 | 125.3 |
+| 10 tables RESET | 235.7 | 224.6 |
+| 10 tables REVERT | 257.0 | 262.5 |
+
+The full adapter's ten-table RESET improved by 4.7%; REVERT was 2.1% slower.
+Client counts remain seven and eleven. The larger overflow penalty is removed,
+but the latency results are mixed, with variation in unchanged CTAS/cleanup
+phases too. Versions ran in separate blocks, baseline first, and native case
+order alternated between repetitions. These local three-sample medians do not
+establish an overall or tail-latency improvement.
+
+The recorded server commit was built and passed Go branch/snapshot/temporary-
+table regressions plus 175 Python adapter/profile/live tests. Coverage includes
+integer extremes, decimal and composite keys, 300-row composite deltas,
+historical/current read views, explicit rollback, parent/child cascades, and
+rollback of an earlier subquery DELETE after a later unique-constraint failure.
 
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
