@@ -2433,6 +2433,90 @@ adapter/profile/live tests. New restore cases cover composite keys, both NULL
 transition directions, already-restored candidates, unrelated later changes,
 exact collated before-images, repeated execution, and explicit rollback.
 
+Local MO commit `2bb7b1e42` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+removes unnecessary target-row deduplication from eligible joined UPDATE plans.
+The previous plan partitioned/sorted rows by physical row ID and evaluated
+`row_number()` even when the joins could not duplicate a target row. This cost
+remained after the earlier scan and equality-filter improvements.
+
+The planner now traces physical row IDs and SQL-equality-compatible primary
+keys through direct projections, filters, sorts, and key-preserving INNER/LEFT
+joins. It skips the deduplication window only after proving that each updated
+target row can occur at most once. The proof uses binding/column identities and
+catalog key/type metadata, independently of estimated cardinalities. It covers
+eligible ordinary single-target joined UPDATEs as well as branch restore SQL.
+Unsupported projections or operators, nonunique sources, incomplete composite
+keys, incompatible equality domains, nullable-side targets, and multi-target
+updates retain their existing handling. Locks, NULL-target protection, affected
+row accounting, uniqueness checks, and foreign-key behavior stay in place.
+
+The generated branch DML and the earlier REVERT equality filter are unchanged.
+Sixteen EXPLAIN ANALYZE checks (four old/current restore SQL shapes across four
+fixtures) found no deduplication `Window` or `Partition` operators in the new
+plans. Seven alternating repetitions per fixture also validated row counts and
+values after the first and repeated UPDATE. The small mixed-change REVERT
+UPDATE took about 1.8 ms; larger-table statements still pay for their scans and
+joins, so this is not the complete native request's latency.
+
+A fresh `d2549de4f` / `2bb7b1e42` comparison repeated the native and adapter
+commands above, including `--already-restored` and the 100,000-row
+delete/update/mixed cases. Per build: 132 timed native calls, 24 untimed validated
+first calls, and six adapter workflows. All row/path checks passed. Native
+fixtures retained one client request, three internal DML calls per table and
+zero stages; adapter RESET/REVERT retained seven/eleven client statements.
+Builds ran in separate baseline/after blocks without concurrent builds or tests.
+These tables report three-repetition medians.
+
+| First call: 10 tables × 1,000 rows, 100 changed per category | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| No changes | 61.8 / 61.3 | 74.5 / 73.8 |
+| Insert only | 54.1 / 66.7 | 51.2 / 77.8 |
+| Delete only | 55.3 / 53.5 | 77.9 / 50.7 |
+| Update only | 135.3 / 43.5 | 113.8 / 78.8 |
+| Mixed | 142.7 / 79.0 | 155.6 / 92.2 |
+
+| Further cases | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| First: 10 × 1,000 rows, 300 updates/table | 237.1 / 54.3 | 261.6 / 58.1 |
+| First: 10 × 1,000 rows, 300 changes/category, mixed | 405.6 / 196.1 | 358.1 / 161.8 |
+| First: 1 × 100,000 rows, 100 deletes | 138.5 / 129.6 | 166.8 / 140.8 |
+| First: 1 × 100,000 rows, 100 updates | 119.4 / 92.9 | 130.6 / 145.2 |
+| First: 1 × 100,000 rows, 100 changes/category, mixed | 167.9 / 142.9 | 199.4 / 144.5 |
+| Repeat: 10 × 1,000 rows, 100 updates/table already undone | 45.7 / 33.3 | 72.2 / 67.2 |
+| Repeat: 10 × 1,000 rows, mixed changes already undone | 62.4 / 34.0 | 70.9 / 46.9 |
+
+| UPDATE phase only: 10 tables × 1,000 rows | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| First: 100 updates/table | 81.1 / 10.2 | 64.0 / 20.8 |
+| First: 300 updates/table | 180.3 / 12.0 | 197.1 / 15.5 |
+| Repeat: 100 updates/table already undone | 9.7 / 7.8 | 18.7 / 16.6 |
+
+| Full adapter workflow, 1,000 rows/table, 100 updates/table | Before / after median (ms) |
+| --- | ---: |
+| 1 table RESET | 66.1 / 52.3 |
+| 1 table REVERT | 129.1 / 113.8 |
+| 10 tables RESET | 122.6 / 119.2 |
+| 10 tables REVERT | 217.1 / 176.5 |
+
+With 300 updates per table, the complete ten-table native requests improved
+4.37x for RESET and 4.50x for REVERT; their UPDATE phases improved about 15.0x
+and 12.7x. The full adapter's ten-table REVERT improved 18.7%, while RESET
+improved only 2.8% despite its UPDATE phase falling from 45.0 to 17.5 ms.
+Snapshot and adapter bookkeeping remain substantial parts of the total.
+
+The gains are workload-dependent. First-call REVERT with 100 updates in a
+100,000-row table was 11.2% slower, and ten-table insert-only REVERT with 100
+changes per table was 52.0% slower in this sample. Large-table scans/joins and
+other restore phases remain; these three-repetition local medians do not
+establish a universal or tail-latency improvement.
+
+The recorded final server was built and passed the complete Go planner package,
+relevant UPDATE/branch/snapshot/constraint/executor integrations, and 193 Python
+adapter/profile/live tests. New tests verify actual fast/fallback plan shapes,
+composite keys, duplicate-source row counts, NULL transitions, repeat and
+rollback, unique-constraint failures, and protection for nullable outer targets.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
