@@ -124,7 +124,7 @@ def test_restore_probe_paths_keep_counts_and_timings(fallback):
 
 
 @pytest.mark.parametrize("change", [
-    lambda r: r.update(schema_version=4),
+    lambda r: r.update(schema_version=5),
     lambda r: r.pop("inline_delete_tables"),
     lambda r: r.update(fallback_delete_tables=-1),
     lambda r: r.update(inline_delete_tables=2),
@@ -182,6 +182,64 @@ def test_restore_subquery_and_staged_paths(path):
 def test_invalid_restore_subquery_records_do_not_publish_totals(change):
     record = restore_subquery_event()
     change(record)
+    result = summarize_restore_work([record], 1, "reset")
+    assert not result["complete"] and result["issues"]
+    assert result["sql_statements"] is None
+
+
+def restore_no_stage_event():
+    record = restore_subquery_event()
+    record.update(schema_version=4, staging="none", subquery_row_tables=1, staged_row_tables=0, empty_stages=0)
+    record["sql_counts"].update(stage_create=0, stage_drop=0, update=1, insert=1)
+    record["phases_ms"].update(stage_create=0, stage_drop=0, update=2, insert=2)
+    return record
+
+
+@pytest.mark.parametrize("path", ["subquery", "staged", "mixed", "partial", "stage_failure", "keyless"])
+def test_restore_row_paths_keep_materialization_and_dml_separate(path):
+    record = restore_no_stage_event()
+    if path in ("staged", "mixed", "stage_failure"):
+        record.update(staging="temporary", subquery_row_tables=0, staged_row_tables=1,
+                      subquery_delete_tables=0, staged_delete_tables=1)
+        record["sql_counts"].update(stage_create=2, stage_drop=1)
+        if path == "mixed":
+            record.update(table_count=2, subquery_row_tables=1, subquery_delete_tables=1)
+            record["sql_counts"].update(delete=2, update=2, insert=2)
+        elif path == "stage_failure":
+            record.update(status="error", staged_row_tables=0, staged_delete_tables=0)
+            record["sql_counts"].update(stage_create=1, stage_drop=0, delete=0, update=0, insert=0)
+    elif path == "partial":
+        record.update(status="error", subquery_row_tables=0)
+        record["sql_counts"].update(update=0, insert=0)
+    elif path == "keyless":
+        record.update(subquery_delete_tables=0)
+        record["sql_counts"]["update"] = 0
+    record["sql_statements"] = sum(record["sql_counts"].values())
+    result = summarize_restore_work([record], 1, "reset")
+    assert result["complete"] and not result["issues"]
+    assert result["records"][0]["staging"] == record["staging"]
+    assert result["sql_statements"] == record["sql_statements"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda r: r.pop("subquery_row_tables"),
+    lambda r: r.pop("staging"),
+    lambda r: r.update(staging="public"),
+    lambda r: r.update(staging="temporary"),
+    lambda r: r.update(subquery_row_tables=True),
+    lambda r: r.update(subquery_row_tables=2),
+    lambda r: r.update(staged_row_tables=-1),
+    lambda r: r.update(staged_row_tables=1),
+    lambda r: r.update(materialized_rows=1),
+    lambda r: r.update(empty_stages=1),
+    lambda r: r["sql_counts"].update(stage_drop=1),
+    lambda r: r["sql_counts"].update(update=0, insert=0),
+])
+def test_invalid_restore_row_paths_do_not_publish_totals(change):
+    record = restore_no_stage_event()
+    change(record)
+    # Keep totals consistent so failures exercise path validation.
+    record["sql_statements"] = sum(record["sql_counts"].values())
     result = summarize_restore_work([record], 1, "reset")
     assert not result["complete"] and result["issues"]
     assert result["sql_statements"] is None

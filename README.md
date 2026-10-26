@@ -1739,8 +1739,10 @@ data operation itself takes one request regardless of table count. Server
 merge work remains one HashDiff per table. MERGE checks permissions for all
 selected tables before applying data and rolls back the entire data statement
 if a later table fails. Schema changes are still reconciled by the adapter.
-RESET/REVERT likewise preflight the selected tables, stage all changes, and
-apply them in one transaction. Schema reconciliation and adapter commit-log
+RESET/REVERT likewise preflight the selected tables and apply their changes
+in one transaction. REVERT and RESET tables without foreign-key dependencies
+read delta subqueries directly; FK-related RESET tables retain staging.
+Schema reconciliation and adapter commit-log
 updates remain outside that data transaction. The server currently computes
 restore differences using joins over snapshot endpoints, so reducing client
 SQL does not imply constant server work or an incremental storage-level
@@ -2062,14 +2064,15 @@ restriction, literal serialization, 128-row/512-cell threshold, and overflow
 CTAS replay. The derived-table boundary is supported by the existing DELETE
 planner, including reads of the target's current and historical versions.
 
-All row deltas are still staged before any target write. For RESET tables
+At this commit, all row deltas were still staged before any target write;
+the next optimization below removes that staging for eligible tables. For RESET tables
 with foreign keys or referencing child tables, delete keys are staged too,
 preserving their pre-write set across earlier cascades. REVERT delete queries
 read immutable snapshots and can use the subquery even with foreign keys.
 Keyless RESET continues to replace contents while retaining table identity.
 The transaction owner, rollback, and synchronous stage cleanup are unchanged.
 
-Restore work logs now use schema version 3. `subquery_delete_tables` counts
+This commit's restore work logs use schema version 3. `subquery_delete_tables` counts
 issued subquery DELETEs; `staged_delete_tables` counts successfully created
 delete stages. The separate `delete_probe` phase is gone; subquery execution
 is included in `delete`. `empty_stages` and `materialized_rows` describe actual
@@ -2125,6 +2128,133 @@ table regressions plus 175 Python adapter/profile/live tests. Coverage includes
 integer extremes, decimal and composite keys, 300-row composite deltas,
 historical/current read views, explicit rollback, parent/child cascades, and
 rollback of an earlier subquery DELETE after a later unique-constraint failure.
+
+MO commit `3b6502605` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+also removes row staging for REVERT and for RESET tables without foreign-key
+dependencies. At this commit, UPDATE joins the delta subquery directly, and
+INSERT reads the same subquery with an anti-join against the current destination. No CTAS,
+stage probe, or stage cleanup is issued for these tables. The derived queries
+retain typed keys, including composite and decimal keys, without literal lists.
+
+REVERT reads immutable before/after snapshots. RESET's delta also reads the
+current target: DELETE removes keys absent from the source snapshot, UPDATE
+restores matching rows, and INSERT re-evaluates the delta to fill remaining
+missing keys. This is safe for tables without FK dependencies. FK-related
+RESET tables still materialize both deltas before any table is modified, so
+earlier cascades cannot change their intended restore set. REVERT uses direct
+subqueries even with foreign keys; keyless RESET inserts the full historical
+rows after a row DELETE, preserving duplicates and relation identity. Keyless
+REVERT remains unsupported.
+
+Work log schema version 4 adds `subquery_row_tables` (tables for which a direct
+UPDATE or INSERT was issued) and `staged_row_tables` (successful row CTASs).
+`staging: "none"` means no stage creation was attempted; `"temporary"` means
+at least one was attempted, including failed work. Existing delete path counts
+remain, and create/drop counts and times are explicitly zero for stage-free
+work. `materialized_rows: 0` describes physical staging, not a zero-row delta.
+Both profilers validate these counters; versions 1–3 remain supported.
+
+For an ordinary primary-key table with writable non-key columns, the new path
+issues three internal DML statements even when the delta is empty. Ten-table
+no-op/insert-only work therefore changes from 21 calls to 30, while
+delete/update/mixed work changes from 41 to 30. This counts restore-owned
+stage/apply/cleanup calls, excluding nested CTAS INSERTs and catalog/transaction
+SQL. The native client request count is still one. Direct queries can scan
+snapshot data twice for UPDATE and INSERT; removing staging is not a guarantee
+of lower latency for every table size or delta.
+
+The next commit, `208cd3224`, simplifies INSERT while keeping the same
+stage-free execution and statement counts. RESET reads historical rows missing
+from the current target directly; it no longer computes the full update delta
+and joins the target a second time. REVERT first selects before-images absent
+from the current target, then compares only those candidates with the after
+snapshot. That comparison is still necessary: a row unchanged by the reverted
+commit but deleted later must not be resurrected. The transaction, UPDATE,
+DELETE, and FK-related RESET staging behavior are unchanged by this follow-up.
+
+A three-build comparison used `3a3aba8fe` (row stages), `3b6502605` (direct
+row subqueries), and `208cd3224` (simplified INSERT), in that order on exclusive
+port 16001 with INFO JSON logging. Each build ran 102 native restore calls and
+six full adapter workflows. All 306 native calls validated every restored row,
+relation identity, and work counters; all eighteen adapter workflows validated
+their data. Runs used three repetitions, alternating native case order within
+repetitions, with no concurrent test or build workload. Values below are local
+medians, not throughput or tail-latency results.
+Changed counts apply per mutation category: the mixed 100-row case combines
+100 inserts, 100 deletes, and 100 updates per table.
+
+| Changes undone, 10 tables × 1,000 rows, 100 changed | RESET staged / direct / final (ms) | REVERT staged / direct / final (ms) |
+| --- | ---: | ---: |
+| No changes | 121.1 / 103.6 / 73.1 | 123.1 / 91.0 / 90.9 |
+| Insert only | 131.6 / 111.6 / 83.1 | 118.9 / 109.5 / 96.0 |
+| Delete only | 128.9 / 202.0 / 246.2 | 144.4 / 203.5 / 183.2 |
+| Update only | 206.6 / 156.6 / 149.7 | 187.1 / 170.4 / 142.9 |
+| Mixed | 233.6 / 246.3 / 331.2 | 254.3 / 265.4 / 271.3 |
+
+| Changes undone, 10 tables × 1,000 rows, 300 changed | RESET staged / final (ms) | REVERT staged / final (ms) |
+| --- | ---: | ---: |
+| No changes | 140.0 / 74.8 | 113.9 / 103.2 |
+| Insert only | 141.0 / 106.8 | 145.5 / 127.2 |
+| Delete only | 140.6 / 234.8 | 119.0 / 180.0 |
+| Update only | 354.5 / 242.7 | 407.5 / 295.8 |
+| Mixed | 453.0 / 542.0 | 436.6 / 490.9 |
+
+Removing stages helped no-op, insert-only, and update-only ten-table requests
+in this sample, but did not improve every workload. In the 100-row delete-only
+RESET case, CTAS and DROP medians fell from 45.6 and 24.3 ms to zero, while
+INSERT rose from 9.8 ms to 143.0 ms in the first direct version and 187.4 ms in
+the final version. The INSERT simplification did not fix this regression.
+By contrast, update-only RESET's INSERT fell from 47.0 to 30.3 ms between the
+two stage-free versions. These phase medians are independent and need not sum
+to the median request latency.
+
+The profiler now accepts `--mutations`, allowing a larger-table check without
+running unrelated cases. One table with 100,000 rows and 100 changed rows
+(`mixed` changes 100 rows in each mutation category) showed the remaining cost
+of repeated snapshot reads:
+
+| Large-table request | Staged / direct / final median (ms) |
+| --- | ---: |
+| RESET update | 135.0 / 140.8 / 148.5 |
+| REVERT update | 150.3 / 174.6 / 166.8 |
+| RESET mixed | 147.2 / 194.4 / 153.9 |
+| REVERT mixed | 130.5 / 169.0 / 184.7 |
+
+| Full adapter workflow, 1,000 rows, 100 updates | Staged / direct / final median (ms) |
+| --- | ---: |
+| 1 table RESET | 73.8 / 54.6 / 74.7 |
+| 1 table REVERT | 140.9 / 124.1 / 122.6 |
+| 10 tables RESET | 239.1 / 186.0 / 149.2 |
+| 10 tables REVERT | 274.7 / 241.0 / 250.4 |
+
+The final ten-table adapter RESET is 37.6% faster than the staged baseline and
+REVERT is 8.8% faster; client counts remain seven and eleven. These gains do
+not establish that stage-free execution is universally faster. Deleted-row
+restoration, mixed changes, and large-table sparse deltas still need work on
+the DML execution plans. FK-related RESET staging is also still present.
+
+For each server build, start a separate exclusive INFO JSON log and run:
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_restore --tables 1 10 \
+  --rows 1000 --changed 100 --reps 3 --server-log /tmp/mo.log --out /tmp/restore-small.json
+MO_PORT=16001 python -m scripts.profile_matrixone_restore --tables 10 \
+  --rows 1000 --changed 300 --reps 3 --server-log /tmp/mo.log --out /tmp/restore-large.json
+MO_PORT=16001 python -m scripts.profile_matrixone_restore --tables 1 \
+  --rows 100000 --changed 100 --mutations update mixed --reps 3 \
+  --server-log /tmp/mo.log --out /tmp/restore-sparse.json
+MO_PORT=16001 python -m scripts.profile_matrixone_operations --tables 1 10 \
+  --rows 1000 --changed 100 --reps 3 --modes database \
+  --server-log /tmp/mo.log --out /tmp/restore-adapter.json
+```
+
+The final server was built from its recorded commit. Go branch, snapshot,
+temporary-table, and SQL integration regressions plus 193 Python
+adapter/profile/live tests passed. New cases cover
+re-evaluation after UPDATE, missing or resurrected current rows, preserving
+later deletions of unchanged rows, NULLs, parent/child cascades, repeated calls,
+explicit rollback, and failure/cancellation/panic without stage cleanup.
 
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against

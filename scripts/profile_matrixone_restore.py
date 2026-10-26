@@ -98,6 +98,15 @@ def run_once(tables, rows, changed, operation, mutation, server_log):
             expected_empty = tables * int(mutation in ("noop", "insert"))
             if record["subquery_delete_tables"] != tables or record["staged_delete_tables"] != 0:
                 raise AssertionError(f"unexpected restore delete path: {record}")
+        elif record["schema_version"] == 4:
+            # No FK dependencies: all three DML statements read subqueries.
+            # Zero materialized rows measures staging, not the restored delta.
+            expected_rows = expected_empty = 0
+            expected_counts = dict(stage_create=0, delete=tables, update=tables, insert=tables, stage_drop=0)
+            if (record["staging"] != "none" or record["sql_counts"] != expected_counts
+                    or record["subquery_delete_tables"] != tables or record["staged_delete_tables"] != 0
+                    or record["subquery_row_tables"] != tables or record["staged_row_tables"] != 0):
+                raise AssertionError(f"unexpected stage-free restore path: {record}")
         if (record["unknown_stages"] != 0 or record["materialized_rows"] != expected_rows
                 or record["empty_stages"] != expected_empty or record["table_count"] != tables
                 or record["status"] != "ok" or measurement["statements"] != 1):
@@ -132,6 +141,7 @@ def main():
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--changed", type=int, default=100)
     parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--mutations", nargs="+", choices=CASES, default=CASES)
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -153,7 +163,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for tables in args.tables:
         for rep in range(args.reps):
-            variants = [(op, case) for case in CASES for op in ("reset", "revert")]
+            variants = [(op, case) for case in args.mutations for op in ("reset", "revert")]
             for operation, mutation in (variants if rep % 2 == 0 else reversed(variants)):
                 run = run_once(tables, args.rows, args.changed, operation, mutation, args.server_log)
                 run["repetition"] = rep
@@ -162,14 +172,15 @@ def main():
                 m = run["measurement"]
                 work = m["server_restore_work"]
                 paths = {k: work["records"][0][k] for k in (
-                    "inline_delete_tables", "fallback_delete_tables", "subquery_delete_tables", "staged_delete_tables"
+                    "inline_delete_tables", "fallback_delete_tables", "subquery_delete_tables", "staged_delete_tables",
+                    "subquery_row_tables", "staged_row_tables"
                 ) if k in work["records"][0]}
                 print(tables, operation, mutation,
                       "staging", work["records"][0].get("staging", "unreported"),
                       "sql", work["sql_statements"], "ms", round(m["elapsed_ms"], 2),
                       "create_ms", round(work["phases_ms"]["stage_create"], 2),
                       "probe_ms", round(work["phases_ms"].get("delete_probe", 0), 2),
-                      "delete_paths", paths or "unreported",
+                      "paths", paths or "unreported",
                       "drop_ms", round(work["phases_ms"]["stage_drop"], 2), flush=True)
 
 
