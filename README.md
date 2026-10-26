@@ -2517,6 +2517,101 @@ adapter/profile/live tests. New tests verify actual fast/fallback plan shapes,
 composite keys, duplicate-source row counts, NULL transitions, repeat and
 rollback, unique-constraint failures, and protection for nullable outer targets.
 
+Local MO commit `ac78f41f1` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+admits selective runtime filters when a newly loaded table lacks useful
+primary-key distinct-value statistics. Previously the planner substituted 100
+for missing/degenerate NDV. In a 100,000-row restore, an estimated 5,010 delta
+rows divided by that fallback rejected the filter, even when the actual delta
+contained only 100 keys.
+
+The fallback now uses the table row-count estimate for a complete,
+SQL-equality-compatible single-column primary key on an ordinary INNER join's
+table-scan probe. It requires a finite, nondefault row-count estimate above 100,
+exact column/binding/type identity, and safe scan predicates. Known NDV retains
+the existing cost gate. Other join types, partial composite keys, unsupported
+key domains, unsafe predicates, and unavailable table statistics retain the
+old fallback. Runtime key encoding, payload limits, the disable hint, and
+fallback when the actual key set exceeds the limit are unchanged.
+
+Branch SQL is unchanged: the restore queries still use subqueries. The engine
+builds the optional filter from their results. EXPLAIN ANALYZE on the final
+build showed the current-table scan for a 100,000-row/100-update REVERT reading
+100 rows instead of 100,000, and the outer join consuming 200 rows instead of
+100,100. The two historical scans still read 100,000 rows each. This is a 1,000x
+reduction in one scan's input rows, not a 1,000x latency improvement.
+
+A fresh `2bb7b1e42` / `ac78f41f1` comparison used the same native and adapter
+commands above: per build, 132 timed native calls, 24 untimed validated first
+calls, and six adapter workflows. All result/path checks passed. The fixtures
+retained one native client request, three internal DML calls per table and no
+stages; full adapter RESET/REVERT retained seven/eleven client statements.
+Builds ran in separate baseline/after blocks without concurrent builds or
+tests. The following numbers are three-repetition medians.
+
+| First call: 1 table × 100,000 rows, 100 changed per category | RESET before / after (ms) | REVERT before / after (ms) | REVERT UPDATE phase before / after (ms) |
+| --- | ---: | ---: | ---: |
+| Delete only | 129.3 / 126.1 | 154.5 / 143.8 | 68.8 / 36.4 |
+| Update only | 112.4 / 111.2 | 124.4 / 109.9 | 44.3 / 36.1 |
+| Mixed | 118.6 / 148.3 | 163.4 / 142.8 | 53.5 / 32.6 |
+
+| First call: 10 tables × 1,000 rows, 100 changed per category | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| No changes | 36.7 / 49.2 | 44.2 / 67.6 |
+| Insert only | 42.8 / 64.2 | 49.9 / 77.3 |
+| Delete only | 48.6 / 38.7 | 77.8 / 75.6 |
+| Update only | 58.0 / 68.5 | 49.3 / 78.5 |
+| Mixed | 68.8 / 53.3 | 76.4 / 75.0 |
+
+| Further cases: 10 tables × 1,000 rows | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| First: 300 deletes/table | 41.6 / 69.7 | 85.6 / 84.7 |
+| First: 300 updates/table | 59.1 / 73.6 | 84.8 / 58.5 |
+| First: 300 changes/category, mixed | 157.5 / 174.5 | 179.1 / 175.6 |
+| Repeat: 100 updates/table already undone | 60.9 / 67.7 | 70.6 / 46.4 |
+| Repeat: mixed changes already undone | 41.3 / 33.7 | 65.6 / 45.1 |
+
+| Full adapter workflow, 1,000 rows/table, 100 updates/table | Before / after median (ms) |
+| --- | ---: |
+| 1 table RESET | 59.8 / 46.1 |
+| 1 table REVERT | 128.4 / 133.0 |
+| 10 tables RESET | 93.5 / 102.8 |
+| 10 tables REVERT | 151.4 / 172.6 |
+
+Large-table native REVERT improved about 7–13% overall in this sample; its
+UPDATE phase improved about 18–47%. These gains do not extend consistently to
+small tables or the full adapter. Ten-table adapter REVERT was 14.0% slower,
+and 100,000-row mixed RESET was 25.0% slower. These results remain part of the
+comparison rather than being inferred from the reduced scan count.
+
+A follow-up control alternated `optimizer_hints='runtimeFilter=1'` (disabled)
+and `runtimeFilter=0` on the final isolated server, restoring the original hint
+afterward. It used identical data and SQL inside `BEGIN`/`ROLLBACK`, seven
+repetitions, and checked affected rows and values after first/repeated UPDATEs.
+Plans verified the enabled/disabled filter. These are UPDATE-statement times,
+not complete native requests:
+
+| REVERT UPDATE: 100,000 rows, 100 changed per category | First, disabled / enabled (ms) | Repeat, disabled / enabled (ms) |
+| --- | ---: | ---: |
+| Delete only | 59.7 / 50.5 | 56.4 / 49.7 |
+| Update only | 54.5 / 53.1 | 55.7 / 34.2 |
+| Mixed | 62.2 / 52.8 | 55.0 / 34.1 |
+
+Small-table controls did not show a consistent gain: 1,000-row update-only
+REVERT was 3.08 / 3.10 ms on the first call; repeated mixed REVERT was
+1.72 / 2.86 ms. RESET plans without a runtime filter also varied in latency.
+The control supports reduced work for sparse large-table REVERT, but these
+local medians do not establish a general or tail-latency speedup.
+
+The final committed server was built and passed the complete Go planner and
+hash-build packages, relevant frontend/branch/snapshot/UPDATE/constraint/compile
+and SQL integration regressions, and 193 Python adapter/profile/live tests.
+New cases cover actual filter admission and rejection, missing/known/default
+statistics, key/type/binding guards, disabled hints, nonselective builds,
+first/repeated restore, unrelated later changes, empty build input, exact
+affected counts, and rollback. Existing hash-build tests cover payload limits
+and fallback when actual key counts exceed them.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
