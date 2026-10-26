@@ -2211,8 +2211,8 @@ to the median request latency.
 
 The profiler now accepts `--mutations`, allowing a larger-table check without
 running unrelated cases. One table with 100,000 rows and 100 changed rows
-(`mixed` changes 100 rows in each mutation category) showed the remaining cost
-of repeated snapshot reads:
+(`mixed` changes 100 rows in each mutation category) exposed additional DML
+cost; the diagnosis below identifies an unintended bulk-restore planning mode:
 
 | Large-table request | Staged / direct / final median (ms) |
 | --- | ---: |
@@ -2230,9 +2230,9 @@ of repeated snapshot reads:
 
 The final ten-table adapter RESET is 37.6% faster than the staged baseline and
 REVERT is 8.8% faster; client counts remain seven and eleven. These gains do
-not establish that stage-free execution is universally faster. Deleted-row
-restoration, mixed changes, and large-table sparse deltas still need work on
-the DML execution plans. FK-related RESET staging is also still present.
+not establish that stage-free execution is universally faster. At `208cd3224`,
+deleted-row restoration, mixed changes, and large-table sparse deltas still
+needed work on the DML execution plans. FK-related RESET staging remains.
 
 For each server build, start a separate exclusive INFO JSON log and run:
 
@@ -2255,6 +2255,90 @@ adapter/profile/live tests passed. New cases cover
 re-evaluation after UPDATE, missing or resurrected current rows, preserving
 later deletions of unchanged rows, NULLs, parent/child cascades, repeated calls,
 explicit rollback, and failure/cancellation/panic without stage cleanup.
+
+Local MO commit `7a48eccfd` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+fixes the planning mode behind the INSERT regression above. The background
+executor inferred bulk recovery from an INSERT containing `MO_TS`. Native
+RESET/REVERT use that annotation to read resolved snapshot timestamps, so
+their ordinary INSERTs inherited bulk recovery's `DefaultHugeStats()` estimates
+(100 million rows per scan) and skipped normal duplicate-check planning.
+
+Branch restore now disables that implicit classification on its own executor.
+The option applies to both private transactions and the shared executor used
+inside `BEGIN`. Explicit `ExecRestore` calls and other background callers keep
+their existing recovery behavior. Generated DML, snapshot endpoints, SQL
+counts, and stage eligibility are unchanged: ordinary keyed tables still use
+three internal statements per table and no staging; FK-related RESET tables
+retain pre-cascade staging.
+
+Regression coverage includes timestamp and comment classification, SQL modes,
+explicit recovery after ordinary DML, and executor isolation. End-to-end cases
+exercise an INSERT that conflicts with a unique index added since the snapshot:
+the restore statement must reject it even inside `BEGIN`, and rollback must
+restore the earlier table's changes. Successful restores after removing that
+index still support explicit rollback and repeated execution.
+
+A fresh comparison against `208cd3224` used the same commands above, extending
+the 100,000-row run to `--mutations delete update mixed`. Each build ran 108
+native restore calls and six full adapter workflows. All 216 native calls and
+twelve adapter workflows passed their data checks; every fixture retained
+`staging: "none"` and three internal DML calls per table. Each native-only
+measurement still used one client request. INFO logs and JSON identify the
+server commit and each restore path.
+Builds ran in separate blocks, baseline first, without concurrent builds or
+tests; the tables below report three-repetition medians.
+
+| Changes undone, 10 tables × 1,000 rows, 100 changed per category | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| No changes | 77.3 / 52.6 | 94.7 / 62.2 |
+| Insert only | 93.6 / 46.9 | 101.0 / 64.8 |
+| Delete only | 227.4 / 71.7 | 202.8 / 49.8 |
+| Update only | 154.5 / 131.2 | 157.9 / 125.6 |
+| Mixed | 334.8 / 134.6 | 277.7 / 152.4 |
+
+The targeted delete-only INSERT phase fell from 173.2 to 16.1 ms for RESET and
+133.2 to 14.5 ms for REVERT: approximately 10.8x and 9.2x faster for that phase,
+versus 3.17x and 4.07x for the complete native requests. An isolated five-repeat
+single-table check inside `BEGIN` also reduced native RESET from 23.5 to 8.5 ms;
+the equivalent three SQL statements were already about 7–8 ms in total.
+Their ordinary EXPLAIN plans used an anti-join and estimates near the actual
+table size, helping separate SQL shape from the background annotation issue.
+
+| Changes undone, 10 tables × 1,000 rows, 300 changed per category | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| No changes | 80.9 / 64.5 | 85.2 / 43.9 |
+| Insert only | 93.1 / 65.0 | 118.2 / 86.7 |
+| Delete only | 241.3 / 68.3 | 192.4 / 80.5 |
+| Update only | 286.3 / 242.5 | 288.1 / 266.3 |
+| Mixed | 544.5 / 361.9 | 495.7 / 398.9 |
+
+| One table × 100,000 rows, 100 changed per category | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| Delete only | 126.7 / 139.6 | 152.3 / 133.9 |
+| Update only | 139.1 / 131.1 | 166.6 / 122.4 |
+| Mixed | 188.1 / 165.0 | 172.3 / 176.4 |
+
+Larger-table results remain mixed. Delete-only RESET was 10.2% slower and mixed
+REVERT 2.4% slower in this sample. Normal DML also plans duplicate checks and
+still reads historical/current rows; the small-table INSERT improvement does
+not establish a general large-table or tail-latency speedup.
+
+| Full adapter workflow, 1,000 rows, 100 updates | Before / after median (ms) |
+| --- | ---: |
+| 1 table RESET | 55.6 / 51.3 |
+| 1 table REVERT | 93.8 / 110.2 |
+| 10 tables RESET | 155.8 / 138.1 |
+| 10 tables REVERT | 253.1 / 201.8 |
+
+The full ten-table adapter improved 11.4% for RESET and 20.3% for REVERT, with
+the same seven and eleven client SQL statements. One-table adapter REVERT did
+not improve, despite its INSERT phase falling from 4.2 to 1.3 ms. Snapshot and
+adapter bookkeeping remain part of the end-to-end cost.
+
+The recorded server commit was built and passed Go branch, background restore,
+clone, snapshot, temporary-table, planner, and SQL integration regressions plus
+193 Python adapter/profile/live tests.
 
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
