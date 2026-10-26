@@ -1,3 +1,4 @@
+# [retry20706] patched copy: retries MO error 20706 for branch/snapshot creation (mon/patch_bb_retry.py)
 """MatrixOne backend.
 
 MatrixOne is MySQL-compatible and ships "git for data" primitives: database
@@ -443,15 +444,29 @@ class MatrixOneToolSuite(DBToolSuite):
     # once; the statements below are safe to retry.
     _ER_DEADLOCK = 20701
     _DDL_RETRIES = 5
+    _ER_LOCK_FASTFAIL = 20706  # [retry20706] lock options conflict, wait policy is fast fail
+    _FASTFAIL_RETRIES = 30     # [retry20706]
 
     def _execute_ddl(self, sql: str) -> None:
-        for attempt in range(self._DDL_RETRIES):
+        # [retry20706] 20701 (deadlock): unchanged, _DDL_RETRIES attempts with 0.2 s * n backoff.
+        # 20706 (FastFail lock conflict): MO does not wait and leaves the retry to the caller; retry up to
+        # _FASTFAIL_RETRIES times, backoff min(0.2 s * n, 2 s) with jitter (about one minute in total,
+        # below MO's default lock wait timeout of 120 s). Each retry prints one "[retry20706]" line.
+        attempt = fastfail = 0
+        while True:
             try:
                 self._execute(sql)
                 return
             except pymysql.MySQLError as e:
-                if e.args and e.args[0] == self._ER_DEADLOCK and attempt < self._DDL_RETRIES - 1:
-                    time.sleep(0.2 * (attempt + 1))
+                code = e.args[0] if e.args else None
+                if code == self._ER_DEADLOCK and attempt < self._DDL_RETRIES - 1:
+                    attempt += 1
+                    time.sleep(0.2 * attempt)
+                    continue
+                if code == self._ER_LOCK_FASTFAIL and fastfail < self._FASTFAIL_RETRIES:
+                    fastfail += 1
+                    print(f"[retry20706] retry {fastfail}/{self._FASTFAIL_RETRIES}: {sql[:70]}", flush=True)
+                    time.sleep(min(0.2 * fastfail, 2.0) * random.uniform(0.5, 1.5))
                     continue
                 raise
 
@@ -503,7 +518,7 @@ class MatrixOneToolSuite(DBToolSuite):
 
     def _snapshot(self, db: str, name: str = None) -> str:
         name = name or self._new_snapshot_name()
-        self._execute(f"CREATE SNAPSHOT {_quote(name)} FOR DATABASE {_quote(db)};")
+        self._execute_ddl(f"CREATE SNAPSHOT {_quote(name)} FOR DATABASE {_quote(db)};")
         return name
 
     def _get_table_columns(self, table_name: str) -> list:
@@ -909,7 +924,7 @@ class MatrixOneToolSuite(DBToolSuite):
         db = branch_db_name(
             self.db_name, f"{_TEMP_PREFIX}{ref.commit[-10:]}_{os.getpid() % 10000}_{len(self._temp_dbs)}")
         self._execute(f"DROP DATABASE IF EXISTS {_quote(db)};")
-        self._execute(f"DATA BRANCH CREATE DATABASE {_quote(db)} FROM {_quote(state.db)} "
+        self._execute_ddl(f"DATA BRANCH CREATE DATABASE {_quote(db)} FROM {_quote(state.db)} "
                       f"{{snapshot = '{state.snap}'}};")
         self._temp_dbs[key] = db
         return db
@@ -922,7 +937,7 @@ class MatrixOneToolSuite(DBToolSuite):
             snap, snap_db, seq = row["snap"], row["db"], int(row["seq"])
         else:
             snap, snap_db, seq = self._snapshot(src), src, None
-        self._execute(f"DATA BRANCH CREATE DATABASE {_quote(db)} FROM {_quote(snap_db)} "
+        self._execute_ddl(f"DATA BRANCH CREATE DATABASE {_quote(db)} FROM {_quote(snap_db)} "
                       f"{{snapshot = '{snap}'}};")
         if seq is not None:
             self._execute(f"DELETE FROM {_qt(db, COMMITS_TABLE)} WHERE seq > %s", (seq,))
@@ -1489,7 +1504,7 @@ class MatrixOneToolSuite(DBToolSuite):
         gen = self._registry_row(ref.branch)[1] + 1
         new_db = gen_db_name(self.db_name, ref.branch, gen)
         self._execute_ddl(f"DROP DATABASE IF EXISTS {_quote(new_db)};")
-        self._execute(f"DATA BRANCH CREATE DATABASE {_quote(new_db)} FROM {_quote(upstream.db)} "
+        self._execute_ddl(f"DATA BRANCH CREATE DATABASE {_quote(new_db)} FROM {_quote(upstream.db)} "
                       f"{{snapshot = '{upstream.snap}'}};")
         want_rows = callable(on_conflict)
         conflicts = []
