@@ -7,6 +7,7 @@ Mutation names describe changes being undone. Each sample creates fresh tables
 and snapshots, validates all rows and relation IDs, and removes its scratch data.
 Only the single native restore call is timed. Server counters cover restore's
 stage/apply/cleanup SQL, excluding nested CTAS INSERTs and catalog/transaction SQL.
+With --already-restored, an untimed restore and validation precede the measured repeat.
 """
 
 import argparse
@@ -23,7 +24,7 @@ from scripts.profile_matrixone_operations import SQLTrace, server_identity
 CASES = ("noop", "insert", "delete", "update", "mixed")
 
 
-def run_once(tables, rows, changed, operation, mutation, server_log):
+def run_once(tables, rows, changed, operation, mutation, server_log, *, already_restored=False):
     if tables < 1 or not 0 < 2 * changed < rows or operation not in ("reset", "revert") or mutation not in CASES:
         raise ValueError("positive tables, 0 < 2 * changed < rows, and supported operation/mutation required")
     conn = mo.connect(None)
@@ -76,26 +77,35 @@ def run_once(tables, rows, changed, operation, mutation, server_log):
                    f"AGAINST {db}{{snapshot='{before}'}} TABLES({','.join(names)})")
         else:
             sql = f"DATA BRANCH RESET DATABASE {db} FROM {db}{{snapshot='{before}'}} TABLES({','.join(names)})"
+        def validate_restored():
+            for name in names:
+                actual = list(query(f"select id,v from {db}.{name} order by id"))
+                if actual != expected:
+                    raise AssertionError(f"{operation}/{mutation}/{name}: restored rows differ")
+            if identities() != original_ids:
+                raise AssertionError("relation IDs changed or staging tables leaked")
+
+        if already_restored:
+            query(sql)
+            validate_restored()
         with SQLTrace(conn, server_log) as trace:
             _, measurement = trace.measure(operation, lambda: query(sql))
-        for name in names:
-            actual = list(query(f"select id,v from {db}.{name} order by id"))
-            if actual != expected:
-                raise AssertionError(f"{operation}/{mutation}/{name}: restored rows differ")
-        if identities() != original_ids:
-            raise AssertionError("relation IDs changed or staging tables leaked")
+        validate_restored()
         work = measurement["server_restore_work"]
         if not work["complete"]:
             raise AssertionError(work["issues"])
         record, = work["records"]
-        expected_rows = changed * tables * (3 if mutation == "mixed" else 0 if mutation == "noop" else 1)
-        expected_empty = tables * (2 if mutation == "noop" else 0 if mutation == "mixed" else 1)
+        # A repeated RESET has no remaining delta. REVERT still reads its
+        # immutable before/after delta on servers that materialize stages.
+        stage_mutation = "noop" if already_restored and operation == "reset" else mutation
+        expected_rows = changed * tables * (3 if stage_mutation == "mixed" else 0 if stage_mutation == "noop" else 1)
+        expected_empty = tables * (2 if stage_mutation == "noop" else 0 if stage_mutation == "mixed" else 1)
         if record["schema_version"] == 3:
             # This fixture has no foreign keys, so only row deltas are staged;
             # delete deltas stay inside DELETE's subquery and are not counted
             # as materialized rows or empty stages.
-            expected_rows = changed * tables * (2 if mutation == "mixed" else int(mutation in ("delete", "update")))
-            expected_empty = tables * int(mutation in ("noop", "insert"))
+            expected_rows = changed * tables * (2 if stage_mutation == "mixed" else int(stage_mutation in ("delete", "update")))
+            expected_empty = tables * int(stage_mutation in ("noop", "insert"))
             if record["subquery_delete_tables"] != tables or record["staged_delete_tables"] != 0:
                 raise AssertionError(f"unexpected restore delete path: {record}")
         elif record["schema_version"] == 4:
@@ -123,7 +133,8 @@ def run_once(tables, rows, changed, operation, mutation, server_log):
                     or catalog.get("relation_opens") != endpoints * tables):
                 raise AssertionError(f"unexpected restore metadata accounting: {catalog}")
         return {"tables": tables, "rows_per_table": rows, "changed_per_table": changed,
-                "mutation": mutation, "operation": operation, "validated": True, "measurement": measurement}
+                "mutation": mutation, "operation": operation, "already_restored": already_restored,
+                "validated": True, "measurement": measurement}
     finally:
         try:
             query(f"drop database if exists {db}")
@@ -142,6 +153,8 @@ def main():
     parser.add_argument("--changed", type=int, default=100)
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--mutations", nargs="+", choices=CASES, default=CASES)
+    parser.add_argument("--already-restored", action="store_true",
+                        help="perform and validate one untimed restore before measuring the repeat")
     parser.add_argument("--server-log", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -165,7 +178,8 @@ def main():
         for rep in range(args.reps):
             variants = [(op, case) for case in args.mutations for op in ("reset", "revert")]
             for operation, mutation in (variants if rep % 2 == 0 else reversed(variants)):
-                run = run_once(tables, args.rows, args.changed, operation, mutation, args.server_log)
+                run = run_once(tables, args.rows, args.changed, operation, mutation, args.server_log,
+                               already_restored=args.already_restored)
                 run["repetition"] = rep
                 report["runs"].append(run)
                 args.out.write_text(json.dumps(report, indent=2) + "\n")
@@ -176,6 +190,7 @@ def main():
                     "subquery_row_tables", "staged_row_tables"
                 ) if k in work["records"][0]}
                 print(tables, operation, mutation,
+                      "already_restored", args.already_restored,
                       "staging", work["records"][0].get("staging", "unreported"),
                       "sql", work["sql_statements"], "ms", round(m["elapsed_ms"], 2),
                       "create_ms", round(work["phases_ms"]["stage_create"], 2),

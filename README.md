@@ -2340,6 +2340,99 @@ The recorded server commit was built and passed Go branch, background restore,
 clone, snapshot, temporary-table, planner, and SQL integration regressions plus
 193 Python adapter/profile/live tests.
 
+Local MO commit `d2549de4f` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+reduces UPDATE work within stage-free RESET/REVERT. RESET now joins the current
+target directly to the historical rows and tests their differences in that
+join. The equivalent SQL's EXPLAIN shows two table scans instead of three:
+one current scan and one historical scan. It retains the original null-safe
+comparison and operand order. FK-related RESET retains its pre-cascade stages.
+
+REVERT still derives its immutable before/after delta, but can filter candidates
+already equal to their current rows before the UPDATE pipeline. This is enabled
+only when all writable non-key columns have matching historical types and exact
+equality semantics: booleans, integers, decimals, date/time types, and UUIDs.
+Strings, floating point, complex types, and historical type changes retain the
+original REVERT UPDATE. For example, a collated current value `alpha` must still
+be assigned its exact before-image `Alpha`. A repeated old UPDATE already reports
+zero affected rows; the measured saving is in candidate processing downstream.
+
+`scripts.profile_matrixone_restore --already-restored` now performs and validates
+one untimed restore before measuring a repeat. Each sample records
+`already_restored` in JSON; validation and that first call are outside the timed
+request. REVERT validation also checks that unrelated later changes survive.
+
+```bash
+MO_PORT=16001 python -m scripts.profile_matrixone_restore --tables 1 10 \
+  --rows 1000 --changed 100 --mutations update mixed --already-restored --reps 3 \
+  --server-log /tmp/mo.log --out /tmp/restore-repeat.json
+```
+
+A fresh comparison against `7a48eccfd` used the previous first-call commands
+(including delete/update/mixed for 100,000 rows) plus this repeated-call command.
+Each build ran 132 timed native calls, 24 untimed validated first calls, and six
+full adapter workflows. All 264 timed native calls, 48 untimed calls, and twelve
+adapter workflows passed their data checks. The integer fixtures still used one
+client request, three internal DML calls per table, and zero stages. Builds ran
+in separate blocks, baseline first, without concurrent builds or tests. Values
+below are three-repetition medians; before/after always refers to these builds,
+not to the first and repeated call.
+
+| First call: 10 tables × 1,000 rows, 100 changed per category | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| No changes | 38.7 / 62.5 | 52.1 / 71.2 |
+| Insert only | 76.7 / 59.2 | 96.2 / 68.9 |
+| Delete only | 66.5 / 65.2 | 90.1 / 72.2 |
+| Update only | 131.8 / 134.8 | 137.7 / 119.1 |
+| Mixed | 124.8 / 147.5 | 180.8 / 170.8 |
+
+| Further cases | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| First: 10 × 1,000 rows, 300 updates | 267.9 / 252.6 | 290.9 / 283.6 |
+| First: 10 × 1,000 rows, 300 changes/category, mixed | 345.8 / 374.6 | 375.5 / 394.8 |
+| First: 1 × 100,000 rows, 100 deletes | 131.0 / 150.2 | 128.5 / 179.3 |
+| First: 1 × 100,000 rows, 100 updates | 169.8 / 97.4 | 134.3 / 140.7 |
+| First: 1 × 100,000 rows, 100 changes/category, mixed | 178.1 / 132.1 | 154.7 / 166.4 |
+| Repeat: 1 × 1,000 rows, 100 updates already undone | 13.5 / 13.8 | 23.8 / 16.9 |
+| Repeat: 1 × 1,000 rows, mixed changes already undone | 14.9 / 8.9 | 29.7 / 11.3 |
+| Repeat: 10 × 1,000 rows, 100 updates/table already undone | 37.1 / 46.0 | 164.5 / 72.7 |
+| Repeat: 10 × 1,000 rows, mixed changes already undone | 48.8 / 51.5 | 223.9 / 75.8 |
+
+| UPDATE phase only | RESET before / after (ms) | REVERT before / after (ms) |
+| --- | ---: | ---: |
+| First: 10 × 1,000 rows, 100 updates/table | 85.7 / 83.5 | 76.6 / 61.4 |
+| First: 1 × 100,000 rows, 100 updates | 74.6 / 37.4 | 52.2 / 51.6 |
+| Repeat: 10 × 1,000 rows, 100 updates/table already undone | 10.5 / 10.9 | 94.2 / 19.8 |
+
+| Full adapter workflow, 1,000 rows/table, 100 updates/table | Before / after median (ms) |
+| --- | ---: |
+| 1 table RESET | 87.9 / 54.0 |
+| 1 table REVERT | 134.5 / 104.1 |
+| 10 tables RESET | 133.1 / 117.3 |
+| 10 tables REVERT | 217.8 / 202.5 |
+
+The full adapter retains seven RESET and eleven REVERT client statements.
+The largest gains are in large-table RESET and repeated REVERT. First-call
+results are mixed: ten-table mixed RESET was 18.2% slower, and 100,000-row
+delete-only REVERT was 39.6% slower in the native-request comparison.
+
+A follow-up control alternated the old/new SQL shapes on identical fixtures
+inside `BEGIN`/`ROLLBACK`, seven repetitions on the final build. For 100,000 rows
+and 100 updates, RESET's UPDATE fell from 54.0 to 34.6 ms. For 1,000-row mixed
+changes, repeated REVERT's UPDATE fell from 8.1 to 1.8 ms. The control also
+retained first-call REVERT regressions: delete-only UPDATE was 47.5 / 60.0 ms
+at 100,000 rows, and an empty-delta UPDATE was 1.5 / 2.6 ms at 1,000 rows.
+REVERT's plan still has three scans and now has an extra filter. This filter
+benefits already-restored candidates but does not guarantee a first-call gain.
+
+These local medians distinguish phase gains from end-to-end latency and repeated
+calls from first calls; they do not establish a general or tail-latency speedup.
+The recorded final server was built and passed Go branch, snapshot, planner,
+background executor, and SQL integration regressions plus 193 Python
+adapter/profile/live tests. New restore cases cover composite keys, both NULL
+transition directions, already-restored candidates, unrelated later changes,
+exact collated before-images, repeated execution, and explicit rollback.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
