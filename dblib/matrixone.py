@@ -1,4 +1,5 @@
 # [retry20706] patched copy: retries MO error 20706 for branch/snapshot creation (mon/patch_bb_retry.py)
+# [seedfk] patched copy: macrobench seed LOADs run with foreign_key_checks = 0 (mon/patch_bb_seedfk.py)
 """MatrixOne backend.
 
 MatrixOne is MySQL-compatible and ships "git for data" primitives: database
@@ -886,18 +887,23 @@ class MatrixOneToolSuite(DBToolSuite):
         buf = io.StringIO()
         writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
         n = 0
-        for row in rows:
-            writer.writerow([cell(v) for v in row])
-            n += 1
-            if n >= self.SEED_LOAD_CHUNK_ROWS:
+        # [seedfk] the seed is generated consistent; check foreign keys on the measured operations only
+        db.sql("SET SESSION foreign_key_checks = 0")
+        try:
+            for row in rows:
+                writer.writerow([cell(v) for v in row])
+                n += 1
+                if n >= self.SEED_LOAD_CHUNK_ROWS:
+                    db.sql(stmt, (buf.getvalue(),))
+                    total += n
+                    buf = io.StringIO()
+                    writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
+                    n = 0
+            if n:
                 db.sql(stmt, (buf.getvalue(),))
                 total += n
-                buf = io.StringIO()
-                writer = csv.writer(buf, lineterminator="\n", quoting=csv.QUOTE_MINIMAL, doublequote=True)
-                n = 0
-        if n:
-            db.sql(stmt, (buf.getvalue(),))
-            total += n
+        finally:
+            db.sql("SET SESSION foreign_key_checks = 1")
         return total
 
     def _storage_bytes(self) -> int:
