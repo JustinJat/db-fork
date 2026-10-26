@@ -2612,6 +2612,99 @@ first/repeated restore, unrelated later changes, empty build input, exact
 affected counts, and rollback. Existing hash-build tests cover payload limits
 and fallback when actual key counts exceed them.
 
+Local MO commit `2b3b4dfb9` on
+[branchbench-opt](https://github.com/zuyu/matrixone/tree/branchbench-opt)
+removes a repeated current-table scan from eligible RESET DELETE statements.
+The previous statement computed current keys absent from the snapshot, then
+joined those keys back to the current table to delete them. The new statement
+directly deletes from the current side of a LEFT JOIN against a subquery of
+snapshot primary keys, using the snapshot's NOT NULL key as the missing-row
+marker. EXPLAIN shows an ANTI join with two base-table scans instead of three.
+The derived-table boundary still supports same-table historical reads.
+
+This applies to keyed RESET tables without foreign-key dependencies. FK-related
+RESETs retain their pre-write stages so earlier cascades cannot change later
+tables' deltas. The keyless path and REVERT retain their existing SQL. Composite
+keys use every key component; only key columns are projected from the snapshot.
+The normal keyed fixtures still issue three internal DML statements per table
+without staging or literal key lists.
+
+A seven-repetition control alternated the old/new DELETE SQL on identical
+fixtures on `ac78f41f1`, inside `BEGIN`/`ROLLBACK`. Each first/repeated DELETE
+checked its affected count and all remaining rows, and rollback restored the
+original rows. These are individual DELETE timings:
+
+| One table, 100 changed per category | First, old / new (ms) | Repeat, old / new (ms) |
+| --- | ---: | ---: |
+| 1,000 rows, no changes | 1.70 / 1.10 | 1.39 / 1.00 |
+| 1,000 rows, insert only | 1.37 / 1.12 | 1.41 / 1.09 |
+| 1,000 rows, mixed | 1.41 / 1.19 | 1.20 / 1.06 |
+| 100,000 rows, no changes | 34.9 / 34.2 | 28.7 / 47.4 |
+| 100,000 rows, insert only | 58.3 / 45.2 | 35.4 / 48.0 |
+| 100,000 rows, mixed | 47.9 / 45.2 | 33.1 / 29.6 |
+
+There is a tradeoff for an empty delete delta: the old plan can skip its final
+target read after building an empty key set. The direct plan obtains current
+row IDs while scanning before the anti join rejects unchanged keys. Fewer
+logical scans therefore do not guarantee a gain on no-op or repeated deletes.
+
+A fresh `ac78f41f1` / `2b3b4dfb9` native comparison used the preceding profile
+commands, adding `insert` to the 100,000-row `--mutations` list. Per build:
+138 timed native calls, 24 untimed validated first calls for the repeat cases,
+and six full adapter workflows. Both builds passed all result/path checks.
+Native requests retained one client statement, three internal DML statements
+per table and zero stages; adapter RESET/REVERT retained seven/eleven client
+statements. Baseline and final runs used separate blocks with no concurrent
+builds or tests. The following tables report three-repetition medians.
+
+| First RESET: 1 table × 100,000 rows, 100 changed per category | Complete request before / after (ms) | DELETE phase before / after (ms) |
+| --- | ---: | ---: |
+| Insert only | 124.9 / 99.5 | 55.3 / 33.2 |
+| Delete only | 135.2 / 128.3 | 42.6 / 43.5 |
+| Update only | 113.1 / 89.1 | 24.3 / 24.4 |
+| Mixed | 123.5 / 114.1 | 38.3 / 25.9 |
+
+| First call: 10 tables × 1,000 rows, 100 changed per category | RESET before / after (ms) | RESET DELETE phase before / after (ms) | REVERT control before / after (ms) |
+| --- | ---: | ---: | ---: |
+| No changes | 64.0 / 48.1 | 15.2 / 9.5 | 42.1 / 39.4 |
+| Insert only | 66.2 / 55.1 | 19.0 / 9.6 | 47.4 / 78.0 |
+| Delete only | 39.9 / 36.7 | 8.3 / 6.9 | 83.2 / 75.6 |
+| Update only | 67.8 / 39.8 | 15.1 / 7.0 | 47.2 / 50.6 |
+| Mixed | 80.3 / 50.9 | 18.7 / 9.2 | 112.4 / 72.7 |
+
+| Further RESET cases: 10 tables × 1,000 rows | Complete request before / after (ms) | DELETE phase before / after (ms) |
+| --- | ---: | ---: |
+| First: 300 inserts/table | 51.2 / 63.7 | 13.8 / 14.0 |
+| First: 300 deletes/table | 70.4 / 66.1 | 13.2 / 12.4 |
+| First: 300 updates/table | 52.7 / 49.1 | 8.5 / 7.3 |
+| First: 300 changes/category, mixed | 168.2 / 175.2 | 17.0 / 17.6 |
+| Repeat: 100 updates/table already undone | 58.2 / 54.5 | 15.5 / 12.3 |
+| Repeat: mixed changes already undone | 61.4 / 48.7 | 15.0 / 9.8 |
+
+| Full adapter workflow, 1,000 rows/table, 100 updates/table | Before / after median (ms) |
+| --- | ---: |
+| 1 table RESET | 45.0 / 43.9 |
+| 1 table REVERT | 86.2 / 110.1 |
+| 10 tables RESET | 104.2 / 97.7 |
+| 10 tables REVERT | 156.5 / 166.6 |
+
+For 100,000 rows and 100 inserts, native RESET improved 20.3% overall and
+40.1% in DELETE; mixed RESET improved 7.6% overall and 32.4% in DELETE.
+Ten-table RESET with 300 inserts per table was instead 24.3% slower. The
+unchanged REVERT control and unchanged RESET phases also varied substantially:
+the 100,000-row update-only RESET gain came despite an unchanged DELETE median,
+and the ten-table adapter RESET gain came despite DELETE rising from 10.2 to
+12.8 ms. These local medians cannot attribute every end-to-end change to the
+rewrite or establish a universal or tail-latency improvement.
+
+The final committed server was built and passed relevant Go frontend,
+branch/snapshot, planner, compile and SQL integration regressions plus 193
+Python adapter/profile/live tests. New tests verify two base-table scans and
+the ANTI plan, single/composite keys, empty snapshots, nullable payloads,
+unique-index maintenance, first/repeated DELETE affected counts, complete
+RESET results and rollback. Existing regressions cover key-only and keyless
+tables, constraints, and foreign-key cascades with staged RESET fallbacks.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and
