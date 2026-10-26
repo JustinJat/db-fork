@@ -102,7 +102,7 @@ def summarize_restore_work(records, expected_requests, operation):
     ids = [r.get("request_id") for r in work]
     if any(not isinstance(i, str) or not i for i in ids) or len(set(map(str, ids))) != len(ids):
         issues.append("missing or duplicate restore IDs")
-    keys = {"stage_create", "delete", "update", "insert", "stage_drop"}
+    base_keys = {"stage_create", "delete", "update", "insert", "stage_drop"}
 
     def integer(v):
         return type(v) is int and v >= 0
@@ -111,8 +111,10 @@ def summarize_restore_work(records, expected_requests, operation):
         return type(v) in (int, float) and math.isfinite(v) and v >= 0
 
     for record in work:
+        version = record.get("schema_version")
+        keys = base_keys | ({"delete_probe"} if version == 2 else set())
         counts, phases = record.get("sql_counts"), record.get("phases_ms")
-        valid = (record.get("schema_version") == 1 and record.get("operation") == operation
+        valid = (version in (1, 2) and record.get("operation") == operation
                  and record.get("status") in ("ok", "error", "panic")
                  and all(integer(record.get(k)) for k in ("table_count", "sql_statements", "empty_stages",
                                                           "unknown_stages", "materialized_rows"))
@@ -120,12 +122,20 @@ def summarize_restore_work(records, expected_requests, operation):
                  and all(integer(v) for v in counts.values())
                  and isinstance(phases, dict) and set(phases) == keys | {"other"}
                  and all(duration(v) for v in phases.values()) and duration(record.get("total_ms")))
+        if version == 2:
+            valid = valid and all(integer(record.get(k)) for k in ("inline_delete_tables", "fallback_delete_tables"))
         if not valid:
             issues.append("invalid or unsupported restore work record")
             continue
         if sum(counts.values()) != record["sql_statements"]:
             issues.append("restore SQL counts do not sum to sql_statements")
-        if record["empty_stages"] + record["unknown_stages"] > counts["stage_create"]:
+        inline = record.get("inline_delete_tables", 0) if version == 2 else 0
+        if version == 2:
+            completed_probes = inline + record["fallback_delete_tables"]
+            if (completed_probes > counts["delete_probe"] or completed_probes > record["table_count"]
+                    or (record["status"] == "ok" and completed_probes != counts["delete_probe"])):
+                issues.append("restore delete probes do not match completed paths")
+        if record["empty_stages"] + record["unknown_stages"] > counts["stage_create"] + inline:
             issues.append("restore stage counts exceed materialization attempts")
         if not math.isclose(sum(phases.values()), record["total_ms"], rel_tol=1e-6, abs_tol=1e-6):
             issues.append("restore phases do not sum to total_ms")
@@ -136,7 +146,7 @@ def summarize_restore_work(records, expected_requests, operation):
             counts.update(record["sql_counts"])
             phases.update(record["phases_ms"])
     return {"available": bool(work), "complete": complete, "issues": list(dict.fromkeys(issues)),
-            "scope": "restore stage/apply/cleanup statements; excludes nested CTAS INSERTs, "
+            "scope": "restore probe/stage/apply/cleanup statements; excludes nested CTAS INSERTs, "
                      "catalog/authorization SQL and transaction finish; status is work status only",
             "sql_statements": sum(r["sql_statements"] for r in work) if complete else None,
             "sql_counts": dict(counts) if complete else None,

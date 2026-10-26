@@ -102,6 +102,51 @@ def test_restore_work_without_staging_label_keeps_counts_without_guessing_path()
     assert "staging" not in result["records"][0]
 
 
+def restore_probe_event():
+    record = restore_event()
+    record.update(schema_version=2, inline_delete_tables=1, fallback_delete_tables=0)
+    record["sql_counts"].update(stage_create=1, delete_probe=1)
+    record["phases_ms"].update(stage_create=2, delete_probe=1)
+    return record
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_restore_probe_paths_keep_counts_and_timings(fallback):
+    record = restore_probe_event()
+    if fallback:
+        record.update(inline_delete_tables=0, fallback_delete_tables=1, sql_statements=4)
+        record["sql_counts"]["stage_create"] = 2
+    result = summarize_restore_work([record], 1, "reset")
+    assert result["complete"] and not result["issues"]
+    assert result["sql_counts"]["delete_probe"] == 1
+    assert result["phases_ms"]["delete_probe"] == 1
+    assert result["sql_statements"] == (4 if fallback else 3)
+
+
+@pytest.mark.parametrize("change", [
+    lambda r: r.update(schema_version=3),
+    lambda r: r.pop("inline_delete_tables"),
+    lambda r: r.update(fallback_delete_tables=-1),
+    lambda r: r.update(inline_delete_tables=2),
+    lambda r: r.update(inline_delete_tables=0),
+    lambda r: r.update(unknown_stages=1),
+    lambda r: r["phases_ms"].pop("delete_probe"),
+])
+def test_invalid_restore_probe_record_does_not_publish_totals(change):
+    record = restore_probe_event()
+    change(record)
+    result = summarize_restore_work([record], 1, "reset")
+    assert not result["complete"] and result["issues"]
+    assert result["sql_statements"] is None
+
+
+def test_failed_restore_probe_can_have_no_completed_path():
+    record = restore_probe_event()
+    record.update(status="error", inline_delete_tables=0, empty_stages=1)
+    result = summarize_restore_work([record], 1, "reset")
+    assert result["complete"] and result["sql_counts"]["delete_probe"] == 1
+
+
 @pytest.mark.parametrize("operation", ["reset", "revert"])
 def test_trace_attributes_restore_work_to_current_native_request(tmp_path, operation):
     log = tmp_path / "mo.log"

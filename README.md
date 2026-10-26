@@ -1958,6 +1958,88 @@ preservation of user-created temporary tables, dotted database names, and an
 uncommitted destination database. They check that physical staging tables are
 gone before transaction finish, including their generated temporary prefixes.
 
+MO commit `99c014307` removes delete staging tables for bounded integer-key
+deltas in RESET/REVERT. A server-side SELECT probes one row beyond the smaller
+of 128 rows and 512 key cells per table. If the delta fits, the server retains
+the exact signed/unsigned integer literals and applies `DELETE ... WHERE key
+IN (...)`; an empty result skips that DELETE. Composite integer keys are
+supported, with matching key types required at every endpoint. Source-row
+stages and unsupported key types retain the temporary-table path. Every delta
+is still materialized before any target write, under the same owner transaction;
+no keys are returned to the client.
+
+An overflowing probe releases its result and falls back to CTAS, so this case
+runs the delta query twice and adds one background SELECT per table. The row
+limit bounds retained results, not the scan/join work required by the probe.
+The fast path replaces a CTAS with a SELECT: restore-owned SQL counts stay the
+same while fewer staging tables are created and dropped.
+
+Restore work logs use schema version 2, adding the `delete_probe` SQL count and
+timing, `inline_delete_tables` (including empty deltas), and
+`fallback_delete_tables` (probe overflow). `empty_stages` and
+`materialized_rows` now cover both in-memory and temporary-table deltas, without
+counting overflow probes twice. The profilers retain support for version 1
+logs, expose probe timings, and label missing path counters as `unreported`.
+
+A fresh comparison of `5a1dfa610` and `99c014307` used the same exclusive
+port 16001, INFO logging, 1,000 rows per table, and three repetitions. With
+100 changed rows, all ten-table scenarios used the bounded path: 20 CTASs
+became 10 CTASs plus 10 SELECTs, and the single cleanup statement dropped 10
+tables instead of 20. Median native request latency was:
+
+| Changes undone, 10 tables | RESET before/after (ms) | REVERT before/after (ms) |
+| --- | ---: | ---: |
+| No changes | 202.3 / 143.4 | 215.8 / 114.2 |
+| Insert only | 179.4 / 130.9 | 197.3 / 111.8 |
+| Delete only | 185.8 / 135.1 | 194.0 / 149.7 |
+| Update only | 268.0 / 203.2 | 274.5 / 226.9 |
+| Mixed | 290.1 / 231.4 | 304.5 / 215.0 |
+
+The ten-table CTAS phase fell from 77–120 ms to 42–62 ms across these cases;
+the new probe phase cost 7–10 ms. Complete native requests improved by
+1.21–1.89x. For example, update-only RESET's stage creation fell from 90.6 to
+54.0 ms and cleanup from 76.0 to 24.4 ms, with 8.5 ms of probes. Its 41
+restore-owned SQL calls and one client request did not change.
+
+The full adapter comparison, including metadata and commit bookkeeping, used
+the same operation-profiler command as above:
+
+| Tables | Operation | Before median (ms) | After median (ms) |
+| ---: | --- | ---: | ---: |
+| 1 | RESET | 74.8 | 77.1 |
+| 1 | REVERT | 146.2 | 106.1 |
+| 10 | RESET | 291.4 | 249.1 |
+| 10 | REVERT | 341.0 | 283.6 |
+
+Ten-table adapter latency fell by 14.5% for RESET and 16.8% for REVERT, with
+client SQL counts still seven and eleven respectively. One-table results are
+mixed: adapter RESET did not improve, and native update-only RESET rose from
+25.7 to 30.0 ms even though most other single-table cases were faster.
+
+A second native run used `--tables 10 --changed 300`. Insert-only and mixed
+cases then overflowed the delete-key probe at every table, adding ten SELECTs
+per request. Their medians show the cost and variance of the fallback:
+
+| Changes undone, 10 tables | RESET before/after (ms) | REVERT before/after (ms) | SQL calls before/after |
+| --- | ---: | ---: | ---: |
+| Insert only | 218.8 / 205.6 | 195.9 / 218.1 | 31 / 41 |
+| Mixed | 557.7 / 445.9 | 550.7 / 579.2 | 51 / 61 |
+
+The extra probe phase itself cost 6.5–10.1 ms per ten-table request. Other
+phases varied too; these results do not establish a benefit for overflowing
+deltas. In particular, the two REVERT fallback cases slowed by 11.3% and 5.2%.
+All 180 native calls across both versions and both workload sizes passed row,
+identity, materialization-count and cleanup checks; all twelve adapter
+workflows passed. The baseline ran first and the optimized build second,
+alternating native operation/case order between repetitions. These are local
+three-sample medians, not throughput or tail-latency claims.
+
+The server was built from the recorded commit. Go branch/snapshot/temporary-
+table regressions and 165 Python adapter/profile/live tests passed. New tests
+cover empty pipelines, signed/unsigned integer extremes, composite keys,
+128/129-row and 512-cell boundaries, overflow fallback, cancellation, failure
+cleanup, and explicit transaction rollback while preserving relation IDs.
+
 MatrixOne's diff is reliable for two snapshots of one table, for a clone
 (or chain of clones) against its ancestor's head, and for a clone against
 the exact snapshot it was cloned from; it drops the ancestor's updates and

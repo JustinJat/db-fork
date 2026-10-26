@@ -157,6 +157,9 @@ def main():
                       "staging", work["records"][0].get("staging", "unreported"),
                       "sql", work["sql_statements"], "ms", round(m["elapsed_ms"], 2),
                       "create_ms", round(work["phases_ms"]["stage_create"], 2),
+                      "probe_ms", round(work["phases_ms"].get("delete_probe", 0), 2),
+                      "inline_deletes", work["records"][0].get("inline_delete_tables", "unreported"),
+                      "fallback_deletes", work["records"][0].get("fallback_delete_tables", "unreported"),
                       "drop_ms", round(work["phases_ms"]["stage_drop"], 2), flush=True)
 
 
