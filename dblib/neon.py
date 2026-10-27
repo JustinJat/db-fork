@@ -335,6 +335,17 @@ def get_project_branches(project_id: str) -> dict:
     return api_request("GET", f"projects/{project_id}/branches")
 
 
+def resolve_branch_id(project_id: str, branch: str) -> str:
+    """The branch id for ``branch``, which may be an id (br-...) or a branch
+    name: the micro runner hands its last setup branch over by name."""
+    if re.match(r"^br-[a-z0-9-]+$", branch or ""):
+        return branch
+    for b in get_project_branches(project_id).get("branches", []):
+        if b.get("name") == branch or b.get("id") == branch:
+            return b["id"]
+    raise ValueError(f"Neon branch {branch!r} not found in project {project_id}")
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -438,14 +449,14 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
 
     @classmethod
     def _get_neon_connection_uri(cls, project_id: str, branch_id: str, db_name: str) -> str:
-        return connection_uri(project_id, branch_id, db_name)
+        return connection_uri(project_id, resolve_branch_id(project_id, branch_id), db_name)
 
     @classmethod
     def init_for_bench(cls, result_collector: rc.ResultCollector, project_id: str,
                        branch_id: str, branch_name: str, database_name: str,
                        measure_storage: bool = False):
-        return cls(None, result_collector, project_id, branch_name, branch_id,
-                   database_name, measure_storage)
+        return cls(None, result_collector, project_id, branch_name,
+                   resolve_branch_id(project_id, branch_id), database_name, measure_storage)
 
     def __init__(self, connection, result_collector: rc.ResultCollector, project_id: str,
                  branch_name: str, branch_id: str, database_name: str = None,
