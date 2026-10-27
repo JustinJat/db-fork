@@ -91,6 +91,9 @@ NEON_HISTORY_RETENTION_SEC = int(os.environ.get("NEON_HISTORY_RETENTION_SEC", st
 # which then fail with "SSL connection has been closed unexpectedly".
 # The active-compute budget below suspends computes explicitly instead.
 NEON_BRANCH_SUSPEND_TIMEOUT_SEC = int(os.environ.get("NEON_BRANCH_SUSPEND_TIMEOUT_SEC", "-1"))
+# Free plan: the suspend interval cannot be changed (HTTP 412), so leave it out of
+# every compute spec and keep the plan default (5 min idle).
+NEON_FREE_PLAN = os.environ.get("NEON_FREE_PLAN", "0").lower() in ("1", "true", "yes")
 # Active computes the process keeps at most (the plan allows 20 besides the
 # default branch): when a new compute is needed above this, the least
 # recently used idle one is suspended first.
@@ -241,12 +244,14 @@ def wait_operations(project_id: str, operations, record=None, timeout: float = _
 
 
 def _endpoint_spec(suspend_timeout: int) -> dict:
-    return {
+    spec = {
         "type": "read_write",
         "autoscaling_limit_min_cu": NEON_COMPUTE_CU,
         "autoscaling_limit_max_cu": NEON_COMPUTE_CU,
-        "suspend_timeout_seconds": suspend_timeout,
     }
+    if not NEON_FREE_PLAN:
+        spec["suspend_timeout_seconds"] = suspend_timeout
+    return spec
 
 
 # ----------------------------------------------------------------------------
@@ -266,10 +271,11 @@ def create_project(project_name: str) -> dict:
             "default_endpoint_settings": {
                 "autoscaling_limit_min_cu": NEON_COMPUTE_CU,
                 "autoscaling_limit_max_cu": NEON_COMPUTE_CU,
-                "suspend_timeout_seconds": -1,
             },
         }
     }
+    if not NEON_FREE_PLAN:
+        body["project"]["default_endpoint_settings"]["suspend_timeout_seconds"] = -1
     resp = api_request("POST", "projects", json=body)
     wait_operations(resp["project"]["id"], resp.get("operations"))
     return resp
