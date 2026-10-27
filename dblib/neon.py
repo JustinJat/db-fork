@@ -815,6 +815,37 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
         self._temp[key] = b["id"]
         return b["id"]
 
+    def _run_verb(self, verb, fn, ref, **kwargs):
+        """Free plan (10 branches per project): the temporary branches a
+        verb made are deleted once it has returned, outside its latency;
+        otherwise they stay cached until the connection closes."""
+        self._verb_depth = getattr(self, "_verb_depth", 0) + 1
+        try:
+            return super()._run_verb(verb, fn, ref, **kwargs)
+        finally:
+            self._verb_depth -= 1
+            if NEON_FREE_PLAN and self._verb_depth == 0 and self._temp:
+                self._drop_temps()
+
+    def _drop_temps(self) -> None:
+        for key, bid in list(self._temp.items()):
+            if bid == self._conn_branch_id:
+                continue
+            with type(self)._ACT_LOCK:
+                if type(self)._HOLDS.get(bid, 0) > 0:
+                    continue
+            try:
+                self._delete_branch(bid)
+            except Exception as e:
+                print(f"Warning: could not delete temporary branch {bid}: {e}")
+                continue
+            del self._temp[key]
+            for name in [n for n, info in self._branches.items() if info["id"] == bid]:
+                del self._branches[name]
+            self._uris.pop(bid, None)
+            self._endpoints.pop(bid, None)
+            self._fdw_ready.discard(bid)
+
     # ------------------------------------------------------------------
     # Bookkeeping (commit log)
     # ------------------------------------------------------------------
