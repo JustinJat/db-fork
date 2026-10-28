@@ -14,6 +14,7 @@ enum Backend {
   CHRONOS = 10;
   BAUPLAN = 11;
   TERMINUSDB = 12;
+  EGRES = 13;
   
 }
 

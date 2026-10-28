@@ -4,7 +4,7 @@
 # Usage: ./scripts/run_single_thread_bench.sh <backend> <sql_dump_path> <branch_counts> [OPTIONS]
 #
 # Required Arguments:
-#   backend:        dolt, dolt_mysql, seekdb, neon, xata, file_copy
+#   backend:        dolt, dolt_mysql, seekdb, neon, xata, file_copy, egres
 #   sql_dump_path:  Path to SQL dump file (e.g., schemas/tpcc_mini.sql)
 #   branch_counts:  Comma-separated list of branch counts (e.g., 8,16,32) or single value (e.g., 16)
 #
@@ -100,7 +100,7 @@ if [ -z "$BACKEND" ] || [ -z "$SQL_DUMP_PATH" ] || [ -z "$NUM_BRANCHES" ]; then
     echo "Usage: $0 <backend> <sql_dump_path> <branch_counts> [options]"
     echo ""
     echo "Required:"
-    echo "  backend: dolt, dolt_mysql, seekdb, neon, xata, file_copy"
+    echo "  backend: dolt, dolt_mysql, seekdb, neon, xata, file_copy, egres"
     echo "  sql_dump_path: Path to SQL dump file (e.g., db_setup/tpcc_schema.sql)"
     echo "  branch_counts: Comma-separated list of branch counts (e.g., 8,16,32) or single value (e.g., 16)"
     echo ""
@@ -126,8 +126,8 @@ fi
 BACKEND_UPPER=$(echo "$BACKEND" | tr '[:lower:]' '[:upper:]')
 
 # Validate backend
-if [[ ! "$BACKEND_UPPER" =~ ^(DOLT|DOLT_MYSQL|SEEKDB|NEON|XATA|FILE_COPY)$ ]]; then
-    echo "Error: Invalid backend '$BACKEND'. Must be one of: dolt, dolt_mysql, seekdb, neon, xata, file_copy"
+if [[ ! "$BACKEND_UPPER" =~ ^(DOLT|DOLT_MYSQL|SEEKDB|NEON|XATA|FILE_COPY|EGRES)$ ]]; then
+    echo "Error: Invalid backend '$BACKEND'. Must be one of: dolt, dolt_mysql, seekdb, neon, xata, file_copy, egres"
     exit 1
 fi
 

@@ -61,6 +61,8 @@ from dblib import chronos as chronos_mod
 from dblib.xata import XataToolSuite
 from dblib import terminusdb
 from dblib.terminusdb import TerminusDBToolSuite
+from dblib import egres
+from dblib.egres import EgresToolSuite
 from dblib.db_api import DBToolSuite, Ref
 from dblib import result_collector as rc
 
@@ -380,6 +382,10 @@ def create_db_tools(
         return TerminusDBToolSuite.init_for_bench(
             result_collector, db_name, default_branch, measure_storage
         )
+    if backend == tp.Backend.EGRES:
+        return EgresToolSuite.init_for_bench(
+            result_collector, db_name, default_branch, measure_storage
+        )
     if backend == tp.Backend.NEON:
         return NeonToolSuite.init_for_bench(
             result_collector,
@@ -506,6 +512,13 @@ class BackendManager:
             info.default_branch_name = terminusdb.MAIN_BRANCH
             print(f"Default TerminusDB server: {info.default_uri}")
 
+        elif backend == tp.Backend.EGRES:
+            info.default_uri = EgresToolSuite.get_default_connection_uri()
+            info.default_branch_name = egres.MAIN_BRANCH
+            # An egres branch's ID is its name; main is db_name.
+            info.default_branch_id = db_name
+            print(f"Default egres connection URI: {info.default_uri}")
+
         elif backend == tp.Backend.NEON:
             if require_db_setup:
                 # Leftovers of interrupted runs keep billing: drop them first.
@@ -567,6 +580,9 @@ class BackendManager:
         elif require_db_setup and backend == tp.Backend.TERMINUSDB:
             # No SQL: the dump is converted to a schema and documents.
             terminusdb.setup_database(db_name, sql_dump_path)
+        elif require_db_setup and backend == tp.Backend.EGRES:
+            # No catalog views: the loader records the tables it creates.
+            egres.setup_database(db_name, sql_dump_path)
         elif require_db_setup and backend == tp.Backend.BAUPLAN:
             bauplan.setup_database(db_name, sql_dump_path)
         elif require_db_setup:
@@ -613,6 +629,12 @@ class BackendManager:
         elif self.config.backend == tp.Backend.TERMINUSDB and db_name:
             try:
                 terminusdb.drop_database(db_name)
+            except Exception as e:
+                print(f"Error deleting database: {e}")
+        elif self.config.backend == tp.Backend.EGRES and db_name:
+            try:
+                # Also drops every branch and snapshot database of the run.
+                egres.drop_database(db_name)
             except Exception as e:
                 print(f"Error deleting database: {e}")
         elif self.config.backend == tp.Backend.MATRIXONE and db_name:
@@ -679,6 +701,8 @@ class BackendManager:
             return SeekDBToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.TERMINUSDB:
             return info.default_uri
+        elif backend == tp.Backend.EGRES:
+            return EgresToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.MATRIXONE:
             return MatrixOneToolSuite.get_initial_connection_uri(db_name)
         elif backend == tp.Backend.BAUPLAN:
