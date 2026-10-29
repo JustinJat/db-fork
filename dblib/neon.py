@@ -74,7 +74,8 @@ import dblib.result_collector as rc
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 API_KEY = os.environ.get("NEON_API_KEY_ORG", "")
-NEON_API_BASE_URL = "https://console.neon.tech/api/v2/"
+# Another API address (e.g. a local control plane in front of a self-hosted Neon, scripts/neon_local_cp.py).
+NEON_API_BASE_URL = os.environ.get("NEON_API_BASE_URL", "https://console.neon.tech/api/v2/")
 NEON_REGION = os.environ.get("NEON_REGION", "aws-us-east-1")
 # PostgreSQL major version of new projects (Neon supports 14-18).
 NEON_PG_VERSION = int(os.environ.get("NEON_PG_VERSION", "18"))
@@ -101,6 +102,9 @@ NEON_ACTIVE_BUDGET = int(os.environ.get("NEON_ACTIVE_BUDGET", "18"))
 # Also suspend a branch's compute whenever the connection moves off it
 # (off by default: the budget above only suspends when room is needed).
 NEON_SUSPEND_ON_SWITCH = os.environ.get("NEON_SUSPEND_ON_SWITCH", "0").lower() in ("1", "true", "yes")
+# sslmode of the postgres_fdw connections between branch computes ("require" on the cloud; a self-hosted
+# Neon's computes have no TLS).
+NEON_FDW_SSLMODE = os.environ.get("NEON_FDW_SSLMODE", "require")
 # Token bucket for the API: requests per minute and burst.
 NEON_API_RATE_PER_MIN = float(os.environ.get("NEON_API_RATE_PER_MIN", "600"))
 NEON_API_BURST = int(os.environ.get("NEON_API_BURST", "20"))
@@ -958,8 +962,8 @@ class NeonToolSuite(PgMergeMixin, DBToolSuite):
         srv = f"bb_srv_{remote_branch_id.replace('-', '_')}"
         schema = f"bb_{remote_branch_id.replace('-', '_')}"
         self._exec(conn, f"CREATE SERVER IF NOT EXISTS {_q(srv)} FOREIGN DATA WRAPPER postgres_fdw "
-                         f"OPTIONS (host '{pr.hostname}', dbname '{self.db_name}', port '5432', "
-                         f"sslmode 'require', fetch_size '10000', "
+                         f"OPTIONS (host '{pr.hostname}', dbname '{self.db_name}', port '{pr.port or 5432}', "
+                         f"sslmode '{NEON_FDW_SSLMODE}', fetch_size '10000', "
                          f"options '-c idle_in_transaction_session_timeout=0 -c statement_timeout=0')")
         self._exec(conn, f"CREATE USER MAPPING IF NOT EXISTS FOR CURRENT_USER SERVER {_q(srv)} "
                          f"OPTIONS (user '{pr.username}', password '{pr.password}')")
